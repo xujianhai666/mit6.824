@@ -49,9 +49,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		reducef: reducef,
 	}
 	w.run()
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
 }
 
 type worker struct {
@@ -68,6 +65,9 @@ func (w *worker) run() {
 			w.doMap(reply)
 		case ReduceTask:
 			w.doReduce(reply)
+		case Noop:
+			log.Println("no task, so exist")
+			return
 		}
 	}
 }
@@ -83,6 +83,7 @@ func (w *worker) requestTask() *TaskResponse {
 func (w *worker) doMap(reply *TaskResponse) {
 	var kva []KeyValue
 	for _, fileName := range reply.MapTasks.InputFiles {
+		log.Printf("do map task for file: %v\n", fileName)
 		f, err := os.Open(fileName)
 		if err != nil {
 			log.Fatalf("cannot open %v", fileName)
@@ -95,23 +96,14 @@ func (w *worker) doMap(reply *TaskResponse) {
 		kva = w.mapf(fileName, string(content))
 	}
 
-	encs := make([]*json.Encoder, 0, reply.MapTasks.ReduceOuts)
-	fs := make([]*os.File, 0, reply.MapTasks.ReduceOuts)
+	encs := make([]*json.Encoder, reply.MapTasks.ReduceOuts)
+	fs := make([]*os.File, reply.MapTasks.ReduceOuts)
 	for i := 0; i < int(reply.MapTasks.ReduceOuts); i++ {
 		fileName := fmt.Sprintf("mr-%s-%d", reply.UniqueID, i)
 		f, err := ioutil.TempFile("", fileName)
 		if err != nil {
 			log.Fatalf("cannot create temp file %v", fileName)
 		}
-		//f, err := os.Open(fileName)
-		//if err != nil {
-		//	f, err = os.Create(fileName)
-		//	if err != nil {
-		//		// no care for lab
-		//		log.Fatalf("cannot create %v", fileName)
-		//		return
-		//	}
-		//}
 		enc := json.NewEncoder(f)
 		encs[i] = enc
 		fs[i] = f
@@ -119,13 +111,14 @@ func (w *worker) doMap(reply *TaskResponse) {
 
 	for _, kv := range kva {
 		i := ihash(kv.Key) % int(reply.MapTasks.ReduceOuts)
-		encs[i].Encode(kv.Value)
+		encs[i].Encode(&kv)
 	}
 
 	finishedFileNames := make([]string, 0)
 	for i, f := range fs {
 		fileName := fmt.Sprintf("mr-%s-%d", reply.UniqueID, i)
 		finishedFileNames = append(finishedFileNames, fileName)
+		log.Println("rename file")
 		os.Rename(f.Name(), fileName)
 		f.Close()
 	}
@@ -133,16 +126,18 @@ func (w *worker) doMap(reply *TaskResponse) {
 	// send finish response
 	finishedRequest := &TaskFinishedRequest{
 		UniqueID:    reply.UniqueID,
-		TaskType:    ReduceTask,
+		TaskType:    MapTask,
 		OutputFiles: finishedFileNames,
 	}
 	okReply := &OKResponse{}
 	call("Server.FinishedTasks", finishedRequest, okReply)
+	log.Println("finish map task")
 }
 
 func (w *worker) doReduce(reply *TaskResponse) {
 	var kva = make([]KeyValue, 0)
 	for _, name := range reply.ReduceTasks.InputFiles {
+		log.Printf("do reduce task for file: %v\n", name)
 		f, err := os.Open(name)
 		if err != nil {
 			log.Fatal("open file failed")
@@ -166,6 +161,7 @@ func (w *worker) doReduce(reply *TaskResponse) {
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
 	//
+	log.Printf("kv len: %v\n", len(kva))
 	i := 0
 	for i < len(kva) {
 		j := i + 1
@@ -194,6 +190,7 @@ func (w *worker) doReduce(reply *TaskResponse) {
 	}
 	okReply := &OKResponse{}
 	call("Server.FinishedTasks", finishedRequest, okReply)
+	log.Println("finish reduce task")
 }
 
 //

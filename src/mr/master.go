@@ -40,7 +40,7 @@ type Task struct {
 // workers register by heartbeat rpc, but at this context, we did not detect worker lifecycle because
 // master-worker model is pull-model (actually in production, we use push-mode, heartbeat is necessary).
 type Master struct {
-	p TaskManager
+	p *TaskManager
 }
 
 type TaskManager struct {
@@ -70,6 +70,7 @@ func (m *TaskManager) split() {
 			files:     []string{file},
 			operation: MapTask,
 		}
+		log.Printf("add unAssignment : %#v\n", task)
 		m.unAssignment <- task
 	}
 	m.inFlights = int32(len(m.input.files))
@@ -87,6 +88,7 @@ func (m *TaskManager) split() {
 
 // Tasks allocate map/reduce tasks for worker.
 func (m *TaskManager) AllocateTasks(req *TaskRequest, resp *TaskResponse) error {
+	log.Printf("req allocate task: %#v \n", req)
 	if m.stateDone() {
 		resp.TaskType = Noop
 		return nil
@@ -97,11 +99,13 @@ func (m *TaskManager) AllocateTasks(req *TaskRequest, resp *TaskResponse) error 
 		resp.TaskType = task.operation
 		switch task.operation {
 		case MapTask:
+			log.Println("allocate map task")
 			resp.MapTasks = MapTaskResponse{
 				InputFiles: task.files,
 				ReduceOuts: m.input.nReduce,
 			}
 		case ReduceTask:
+			log.Println("allocate reduce task")
 			resp.ReduceTasks = ReduceTaskResponse{
 				InputFiles: task.files,
 			}
@@ -130,6 +134,7 @@ func (m *TaskManager) FinishedTasks(req *TaskFinishedRequest, reply *OKResponse)
 	m.unfinished.Delete(req.UniqueID)
 	switch req.TaskType {
 	case MapTask:
+		log.Println("finish map task")
 		// maintain reduce task by reduce i
 		for _, name := range req.OutputFiles {
 			params := strings.Split(name, "-")
@@ -148,17 +153,16 @@ func (m *TaskManager) FinishedTasks(req *TaskFinishedRequest, reply *OKResponse)
 					name:      strconv.Itoa(i),
 					operation: ReduceTask,
 					files:     names,
-					startTime: time.Time{},
 				}
 				m.unAssignment <- t
 			}
 		}
 	case ReduceTask:
+		log.Println("finish reduce task")
 		if m.inFlights == 0 {
 			atomic.StoreInt32(&m.done, 1)
 		}
 	}
-	//m.reduceTasks = append(m.reduceTasks,)
 	return nil
 }
 
@@ -167,6 +171,7 @@ func (m *TaskManager) healthCheck() {
 		m.unfinished.Range(func(key, value interface{}) bool {
 			task := value.(*Task)
 			if time.Since(task.startTime) > _timeoutS {
+				log.Printf("task: %#v is timeout\n", task)
 				m.unAssignment <- task
 			}
 			return true
@@ -199,7 +204,6 @@ func (s *Server) FinishedTasks(req *TaskFinishedRequest, reply *OKResponse) erro
 func (s *Server) server() {
 	rpc.Register(s)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -224,7 +228,7 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 
-	p := TaskManager{
+	p := &TaskManager{
 		input: &Job{
 			files:   files,
 			nReduce: int32(nReduce),
