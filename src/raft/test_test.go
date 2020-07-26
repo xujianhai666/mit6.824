@@ -191,6 +191,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.begin("Test (2B): no agreement if too many followers disconnect")
 
 	cfg.one(10, servers, false)
+	DPrintf("pass 10 command")
 
 	// 3 of 5 followers disconnect
 	leader := cfg.checkOneLeader()
@@ -205,6 +206,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	if index != 2 {
 		t.Fatalf("expected index 2, got %v", index)
 	}
+	DPrintf("pass 20 command")
 
 	time.Sleep(2 * RaftElectionTimeout)
 
@@ -212,6 +214,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	if n > 0 {
 		t.Fatalf("%v committed but no majority", n)
 	}
+	DPrintf("pass no majority")
 
 	// repair
 	cfg.connect((leader + 1) % servers)
@@ -228,8 +231,10 @@ func TestFailNoAgree2B(t *testing.T) {
 	if index2 < 2 || index2 > 3 {
 		t.Fatalf("unexpected index %v", index2)
 	}
+	DPrintf("pass 30")
 
 	cfg.one(1000, servers, true)
+	DPrintf("pass 1000")
 
 	cfg.end()
 }
@@ -378,8 +383,10 @@ func TestBackup2B(t *testing.T) {
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
 
+	Debug = 0
 	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
 
+	t.Log("success a random: round-0\n")
 	cfg.one(rand.Int(), servers, true)
 
 	// put leader and one follower in a partition
@@ -388,6 +395,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
 
+	t.Log("failed lots of command: round-1\n")
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
@@ -403,6 +411,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
+	t.Log("success lots of command: round-2\n")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
@@ -416,6 +425,7 @@ func TestBackup2B(t *testing.T) {
 	}
 	cfg.disconnect(other)
 
+	t.Log("fail lots of command: round-3\n")
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
@@ -432,7 +442,10 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect(other)
 
 	// lots of successful commands to new group.
+	t.Log("success lots of command: round-4\n")
+	Debug = 1
 	for i := 0; i < 50; i++ {
+		t.Logf("success lots of command: round-4 for i:%v\n", i)
 		cfg.one(rand.Int(), 3, true)
 	}
 
@@ -440,6 +453,7 @@ func TestBackup2B(t *testing.T) {
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
+	t.Log("success a command: round-5\n")
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()
@@ -452,6 +466,7 @@ func TestCount2B(t *testing.T) {
 
 	cfg.begin("Test (2B): RPC counts aren't too high")
 
+	// 写网络
 	rpcs := func() (n int) {
 		for j := 0; j < servers; j++ {
 			n += cfg.rpcCount(j)
@@ -529,8 +544,9 @@ loop:
 			continue loop
 		}
 
+		// iter + 1
 		if total2-total1 > (iters+1+3)*3 {
-			t.Fatalf("too many RPCs (%v) for %v entries\n", total2-total1, iters)
+			t.Fatalf("too many RPCs (%v) over %v for %v entries\n", total2-total1, (iters+1+3)*3, iters)
 		}
 
 		success = true

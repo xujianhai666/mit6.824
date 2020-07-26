@@ -20,6 +20,7 @@ package raft
 import (
 	"context"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -72,8 +73,6 @@ var (
 	electLock sync.Mutex
 )
 
-// 落后的follower怎么发现新的leader, 等leader发送信息
-//
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -94,23 +93,20 @@ type Raft struct {
 	stateMachine chan ApplyMsg // message store
 	isLeader     int32         // check identity
 	roleCh       chan _Role    // role change notification
-	stateLock    sync.Mutex    // protect state related info modification
+	stateLock    sync.RWMutex  // protect state related info modification
 	role         _Role         // current role
 
-	executeLock sync.Mutex // use lock to keep fifo, reduce code len
-
 	// Volatile state on all servers:
-	commitIndex int32 // index of highest log entry known to be committed
-	lastApplied int32 // index of highest log entry applied to state machine
-
+	commitIndex   int32 // index of highest log entry known to be committed
+	lastApplied   int32 // index of highest log entry applied to state machine
 	lastHeartbeat time.Time
+	executeLock   sync.Mutex // use lock to keep fifo, reduce code len
 
 	// leader info
 	nextIndex  []int32 // for each server, index of the next log entry to send to that server
 	matchIndex []int32 // for each server, index of highest log entry known to be replicated on server
 }
 
-// PROBLEM: voteFor change,
 func (rf *Raft) run() {
 	rf.init()
 
@@ -172,33 +168,51 @@ func (rf *Raft) becomeLeader() {
 	rf.role = _Leader
 	atomic.StoreInt32(&rf.isLeader, 1)
 	rf.stateLock.Unlock()
-	rf.nextIndex = make([]int32, len(rf.peers))
-	rf.matchIndex = make([]int32, len(rf.peers))
+	rf.nextIndex = make([]int32, len(rf.peers))  // (initialized to leader last log index + 1)
+	rf.matchIndex = make([]int32, len(rf.peers)) // (initialized to 0, increases monotonically)
 
+	lastLogIndex := int32(0)
+	if len(rf.log) > 1 {
+		lastLogIndex = int32(len(rf.log) - 1)
+	}
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = lastLogIndex + 1
+	}
+
+	term := rf.currentTerm
 	for {
 		if rf.killed() {
 			return
 		}
 
 		rf.stateLock.Lock()
-		if atomic.LoadInt32(&rf.isLeader) != 1 {
+		if atomic.LoadInt32(&rf.isLeader) != 1 || term != rf.currentTerm {
 			rf.stateLock.Unlock()
 			return
 		}
+		lasthb := rf.lastHeartbeat
 		rf.stateLock.Unlock()
 
-		startT := time.Now()
-		alive := rf.heartbeat()
-		if !alive {
-			return
+		if time.Since(lasthb) >= _HeartbeatTimeout {
+			now := time.Now()
+			alive := rf.heartbeat()
+			if !alive {
+				return
+			}
+			rf.stateLock.Lock()
+			rf.lastHeartbeat = now
+			rf.stateLock.Unlock()
 		}
-		ticks := time.Since(startT)
-		time.Sleep(_HeartbeatTimeout - ticks)
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
 func (rf *Raft) becomeFollower() {
 	rf.stateLock.Lock()
+	if rf.role == _Follower {
+		rf.stateLock.Unlock()
+		return
+	}
 	rf.role = _Follower
 	atomic.StoreInt32(&rf.isLeader, 0)
 	rf.lastHeartbeat = time.Now()
@@ -230,11 +244,9 @@ func (rf *Raft) becomeCandidate() {
 			rf.stateLock.Unlock()
 			return
 		}
-		//rf.stateLock.Unlock()
 
-		// 选举超时、心跳、voter 超时的问题: 另外两个超时?
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
-		DPrintf("[me %v] elect timeout: %v\n", rf.me, electTimeout)
+		DPrintf("[me %v] elect timeout: %v with term: %v\n", rf.me, electTimeout, rf.currentTerm)
 
 		rf.currentTerm = rf.currentTerm + 1
 		if maxTerm > rf.currentTerm {
@@ -259,14 +271,14 @@ func (rf *Raft) becomeCandidate() {
 		count := int32(1)
 		granted := int32(1)
 		quorum := int32(len(rf.peers)/2 + 1)
-		maxTerm := rf.currentTerm // pick maxTerm from peer for elect next round
+		maxTerm = rf.currentTerm // pick maxTerm from peer for elect next round
 		for i, _ := range rf.peers {
 			if i == rf.me {
 				continue
 			}
-			//DPrintf("prepare send vote for peer: %v\n", i)
 			go func(idx int) {
 				reply := &RequestVoteReply{}
+				//DPrintf("[me: %v] send request with term: %v", rf.me, rf.currentTerm)
 				ok := rf.sendRequestVote(idx, req, reply)
 				if !ok {
 					if req.Term != rf.currentTerm {
@@ -281,7 +293,7 @@ func (rf *Raft) becomeCandidate() {
 
 					atomic.AddInt32(&count, 1)
 					if count-granted >= quorum {
-						DPrintf("sendRequestVote [me %v] get not granted >= quorum", rf.me)
+						DPrintf("sendRequestVote [me %v] get not granted: %v >= quorum", rf.me, granted)
 						// elect failed, so back to origin
 						rf.votedFor = -1
 						return
@@ -304,7 +316,7 @@ func (rf *Raft) becomeCandidate() {
 				}
 
 				atomic.AddInt32(&count, 1)
-				if reply.VoteGranted {
+				if ok && reply.VoteGranted {
 					atomic.AddInt32(&granted, 1)
 				}
 
@@ -320,7 +332,7 @@ func (rf *Raft) becomeCandidate() {
 					return
 				}
 				if maxTerm < reply.Term {
-					maxTerm = reply.Term
+					maxTerm = reply.Term + 1
 				}
 				DPrintf("sendRequestVote [me %v] finish count: %v granted:%v", rf.me, count, granted)
 			}(i)
@@ -334,6 +346,10 @@ func (rf *Raft) becomeCandidate() {
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	return int(rf.currentTerm), atomic.LoadInt32(&rf.isLeader) == 1
+}
+
+func (rf *Raft) IsLeader() bool {
+	return atomic.LoadInt32(&rf.isLeader) == 1
 }
 
 //
@@ -408,7 +424,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
-		DPrintf("[ReceiveRequestVote] [me %v] Term <= currentTerm, return", rf.me)
+		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v <= currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		return
 	}
 
@@ -423,6 +439,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 
 		if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
+			rf.lastHeartbeat = time.Now()
 			DPrintf("[ReceiveRequestVote] [me %v] index is oldest, return", rf.me)
 			return
 		}
@@ -473,10 +490,13 @@ type AppendEntriesRequest struct {
 type AppendEntriesResponse struct {
 	Term    int32 // currentTerm, for leader to update itself
 	Success bool  // true if follower contained entry matching prevLogIndex and PrevLogTerm
+
+	LogIndexHint int32
 }
 
 func (rf *Raft) heartbeat() bool {
 	// heartbeat
+	rf.stateLock.Lock()
 	preLogIndex := int32(0)
 	preLogTerm := int32(0)
 	if len(rf.log) > 1 {
@@ -491,22 +511,100 @@ func (rf *Raft) heartbeat() bool {
 		//Entries      : nil,
 		LeaderCommit: rf.commitIndex,
 	}
+	rf.stateLock.Unlock()
 
+	return rf.quorumHeartbeat(*appendReq)
+}
+
+func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 	count := int32(1)
 	success := int32(1)
 	quorum := int32(len(rf.peers)/2 + 1)
 	waitCh := make(chan struct{})
 	for i, _ := range rf.peers {
 		go func(idx int) {
-			if idx == rf.me {
-				return
+
+			for {
+
+				if idx == rf.me {
+					return
+				}
+
+				if !rf.IsLeader() {
+					waitCh <- struct{}{}
+					return
+				}
+
+				appendReply := &AppendEntriesResponse{}
+				ok := rf.sendAppendEntries(idx, &appendReq, appendReply)
+				if !ok {
+					atomic.AddInt32(&count, 1)
+					break
+				}
+
+				if appendReply.Success {
+					atomic.AddInt32(&count, 1)
+					atomic.AddInt32(&success, 1)
+
+					rf.stateLock.Lock()
+					// 目前使用 同步顺序发送, 所以delta=1
+					rf.matchIndex[idx] = appendReq.PrevLogIndex
+					rf.nextIndex[idx] = appendReq.PrevLogIndex + 1
+
+					// update majority agreement
+					matchIndexes := make([]int, len(rf.peers))
+					for i, _ := range rf.matchIndex {
+						matchIndexes[i] = int(rf.matchIndex[i])
+					}
+					sort.Ints(matchIndexes)
+					i := (len(rf.peers) + 1) / 2
+					majority := matchIndexes[i-1]
+
+					// channel notify
+					if int32(majority) > rf.commitIndex {
+						rf.commitIndex = int32(majority)
+						// trigger apply
+						for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+							rf.stateMachine <- ApplyMsg{
+								CommandValid: true,
+								Command:      rf.log[i].Command,
+								CommandIndex: int(i),
+							}
+						}
+					}
+					rf.stateLock.Unlock()
+					// 需要判断结果
+					break
+				}
+
+				// TODO(zero.xu): check whether to apply
+				if ok && appendReply.Success {
+					rf.stateLock.Lock()
+					rf.matchIndex[idx] = appendReq.PrevLogIndex + int32(len(appendReq.Entries))
+					rf.nextIndex[idx] = appendReq.PrevLogIndex + int32(len(appendReq.Entries)) + 1
+					rf.stateLock.Unlock()
+					// 需要判断结果
+					break
+				}
+
+				rf.stateLock.Lock()
+				if rf.currentTerm < appendReply.Term {
+					DPrintf("quorumHeartbeat leader %v term is lower", rf.me)
+					rf.stateLock.Unlock()
+					rf.roleCh <- _Follower
+					waitCh <- struct{}{}
+					return
+				}
+
+				// TODO(zro.xu): term pointer is better
+				DPrintf("quorumHeartbeat resend from %v to %v indicator: %v", rf.me, idx, appendReply.LogIndexHint)
+				rf.nextIndex[idx] = appendReply.LogIndexHint + 1
+				appendReq.PrevLogTerm = rf.log[appendReply.LogIndexHint].Term
+				appendReq.PrevLogIndex = appendReply.LogIndexHint
+				appendReq.LeaderCommit = rf.commitIndex
+				rf.stateLock.Unlock()
 			}
-			appendReply := &AppendEntriesResponse{}
-			ok := rf.sendAppendEntries(idx, appendReq, appendReply)
-			atomic.AddInt32(&count, 1)
-			if ok {
-				atomic.AddInt32(&success, 1)
-			}
+
 			rf.stateLock.Lock()
 			if success >= quorum {
 				rf.stateLock.Unlock()
@@ -519,11 +617,125 @@ func (rf *Raft) heartbeat() bool {
 				return
 			}
 			rf.stateLock.Unlock()
-			//rf.peers[idx].Call("Raft.AppendEntries", appendReq, appendReply)
-
 		}(i)
 	}
-	// wait
+	<-waitCh
+	return success >= quorum
+}
+
+func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
+	count := int32(1)
+	success := int32(1)
+	quorum := int32(len(rf.peers)/2 + 1)
+	waitCh := make(chan struct{}, len(rf.peers))
+	for i, _ := range rf.peers {
+		go func(idx int, appendReq AppendEntriesRequest) {
+			for { // retry fro log inconsistency
+
+				if idx == rf.me {
+					return
+				}
+
+				if !rf.IsLeader() {
+					DPrintf("not leader, existed")
+					waitCh <- struct{}{}
+					return
+				}
+
+				appendReply := &AppendEntriesResponse{}
+				ok := rf.sendAppendEntries(idx, &appendReq, appendReply)
+
+				if !ok {
+					atomic.AddInt32(&count, 1)
+					break
+				}
+				if appendReply.Success {
+					rf.stateLock.Lock()
+
+					// 目前使用 同步顺序发送, 所以delta=1
+					rf.matchIndex[idx] = int32(len(rf.log)) - 1
+					rf.nextIndex[idx] = int32(len(rf.log))
+
+					// update majority agreement
+					matchIndexes := make([]int, len(rf.peers))
+					for i, _ := range rf.matchIndex {
+						matchIndexes[i] = int(rf.matchIndex[i])
+						DPrintf("match %v index: %v for end index: %v\n", i, matchIndexes[i], len(rf.log)-1)
+					}
+					sort.Ints(matchIndexes)
+					i := (len(rf.peers) + 1) / 2
+					majority := matchIndexes[i-1]
+
+					// channel notify
+					if int32(majority) > rf.commitIndex {
+						rf.commitIndex = int32(majority)
+						// trigger apply
+						for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+							rf.stateMachine <- ApplyMsg{
+								CommandValid: true,
+								Command:      rf.log[i].Command,
+								CommandIndex: int(i),
+							}
+						}
+						rf.lastApplied = rf.commitIndex
+						// 发送 commitIndex 变更事件, 这里不需要
+					}
+					// 等待 commitIndex 到最新值
+					rf.stateLock.Unlock()
+					for {
+						rf.stateLock.Lock()
+						if rf.commitIndex == int32(len(rf.log)-1) {
+							rf.stateLock.Unlock()
+							break
+						}
+						rf.stateLock.Unlock()
+						time.Sleep(10 * time.Millisecond)
+					}
+
+					atomic.AddInt32(&count, 1)
+					atomic.AddInt32(&success, 1)
+					break
+				}
+				// not success reason as below:
+				// Reply false if term < currentTerm, exit
+				// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+				// turn index
+				rf.stateLock.Lock()
+				if rf.currentTerm < appendReply.Term {
+					DPrintf("quorumSendAppendEntries leader %v term is lower", rf.me)
+					rf.stateLock.Unlock()
+					rf.roleCh <- _Follower
+					waitCh <- struct{}{}
+					return
+				}
+
+				DPrintf("quorumSendAppendEntries resend from %v to %v indicator: %v to end: %v",
+					rf.me, idx, appendReply.LogIndexHint, len(rf.log)-1)
+				rf.nextIndex[idx] = appendReply.LogIndexHint + 1
+				appendReq.PrevLogTerm = rf.log[appendReply.LogIndexHint].Term
+				appendReq.PrevLogIndex = appendReply.LogIndexHint
+				appendReq.LeaderCommit = rf.commitIndex
+				appendReq.Entries = rf.log[appendReply.LogIndexHint+1:]
+				rf.stateLock.Unlock()
+			}
+
+			// 应该是个 请求处理的锁.
+			rf.stateLock.Lock()
+			if count-success >= quorum {
+				// 失败的话，就不是leader了
+				rf.stateLock.Unlock()
+				rf.roleCh <- _Follower
+				waitCh <- struct{}{}
+				return
+			}
+			if success >= quorum {
+				rf.stateLock.Unlock()
+				waitCh <- struct{}{}
+				return
+			}
+			rf.stateLock.Unlock()
+		}(i, req)
+	}
 	<-waitCh
 	return success >= quorum
 }
@@ -548,7 +760,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 
 func (rf *Raft) monitorLeader() {
 	for {
-		DPrintf("[monitorLeader] [me %v] monitor leader", rf.me)
+		//DPrintf("[monitorLeader] [me %v] monitor leader", rf.me)
 		if rf.killed() {
 			return
 		}
@@ -569,11 +781,12 @@ func (rf *Raft) monitorLeader() {
 	}
 }
 
+// follower append 直接 commit, 然后apply
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesResponse) {
 	rf.executeLock.Lock()
 	defer rf.executeLock.Unlock()
 
-	DPrintf("[ReceiveAppendEntries] [me %v] from [peer: %v]", rf.me, args.LeaderId)
+	//DPrintf("[ReceiveAppendEntries] [me %v] from [peer: %v]", rf.me, args.LeaderId)
 	reply.Success = false
 	rf.stateLock.Lock()
 	// use defer
@@ -581,6 +794,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 
 	if rf.role == _Unknown {
 		DPrintf("[ReceiveAppendEntries] [me %v] is changing role", rf.me)
+		reply.Success = true
 		rf.stateLock.Unlock()
 		return
 	}
@@ -603,6 +817,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 			DPrintf("[ReceiveAppendEntries] [me %v] role is leader, receive high term, so convert to follower", rf.me)
 			// how to check whether new leader
 			rf.role = _Unknown
+			reply.Success = true
 			rf.stateLock.Unlock()
 			rf.roleCh <- _Follower
 			return
@@ -613,35 +828,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		DPrintf("[ReceiveAppendEntries] [me %v] role is %v, so convert to follower", rf.me, rf.role)
 		rf.stateLock.Unlock()
 		// how to check whether new leader
+		reply.Success = true
 		rf.roleCh <- _Follower
 		return
 	}
 
-	if int32(len(rf.log))-1 < args.PrevLogIndex {
-		DPrintf("[ReceiveAppendEntries] [me %v] log is lower, exist", rf.me)
-		rf.stateLock.Unlock()
-		return
-	}
-
-	entry := rf.log[args.PrevLogIndex]
-	if entry.Term != args.PrevLogTerm {
-		DPrintf("[ReceiveAppendEntries] [me %v] Term is not equal, exist", rf.me)
-		rf.log = rf.log[:args.PrevLogIndex-1]
-	}
-
-	if len(args.Entries) == 0 {
-		DPrintf("[ReceiveAppendEntries] [me %v] entries is 0, just heartbeat", rf.me)
+	if int32(len(rf.log))-1 < args.PrevLogIndex || (rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		DPrintf("[ReceiveAppendEntries] [me %v] log %v is lower %v, exist", rf.me, int32(len(rf.log))-1, args.PrevLogIndex)
+		rf.log = rf.log[:rf.commitIndex+1]
+		reply.LogIndexHint = rf.commitIndex
 		rf.lastHeartbeat = time.Now()
 		rf.stateLock.Unlock()
 		return
 	}
 
-	for _, e := range args.Entries {
-		rf.log = append(rf.log, LogEntry{
-			Command: e.Command,
-			Term:    e.Term,
-		})
+	if len(args.Entries) > 0 {
+		rf.log = rf.log[:args.PrevLogIndex+1]
+		for _, e := range args.Entries {
+			rf.log = append(rf.log, LogEntry{
+				Command: e.Command,
+				Term:    e.Term,
+			})
+		}
 	}
+
 	if args.LeaderCommit > rf.commitIndex {
 		commit := args.LeaderCommit
 		if commit > int32(len(rf.log)-1) {
@@ -650,6 +860,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.commitIndex = commit
 	}
 
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		rf.stateMachine <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[i].Command,
+			CommandIndex: int(i),
+		}
+		rf.lastApplied = i
+	}
+	//rf.lastApplied = rf.commitIndex
+	rf.lastHeartbeat = time.Now()
+	reply.Success = true
 	rf.stateLock.Unlock()
 }
 
@@ -668,14 +889,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	DPrintf("start command")
 	index := -1
-	term := -1
+	term := int32(-1)
 	isLeader := true
 
+	_, isLeader = rf.GetState()
+	if !isLeader {
+		return index, int(term), false
+	}
+
+	// TODO: take concurrent out-of-order commit to account
+	rf.stateLock.Lock()
+	preLogIndex := int32(0)
+	preLogTerm := int32(0)
+	if len(rf.log) > 1 {
+		preLogIndex = int32(len(rf.log) - 1)
+		preLogTerm = rf.log[preLogIndex].Term
+	}
+	term = rf.currentTerm
+	newEntry := LogEntry{
+		Command: command,
+		Term:    term,
+	}
+	rf.log = append(rf.log, newEntry)
+	rf.matchIndex[rf.me] = int32(len(rf.log) - 1)
+	entries := []LogEntry{newEntry}
+	appendReq := &AppendEntriesRequest{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: preLogIndex, // change
+		PrevLogTerm:  preLogTerm,  // change
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.stateLock.Unlock()
+
+	quorumAck := rf.quorumSendAppendEntries(*appendReq)
+	if !quorumAck {
+		return int(preLogIndex) + 1, int(term), true
+	}
+
 	// Your code here (2B).
-	// 如何将请求发过去? 后面实现下
-	return index, term, isLeader
+	return int(preLogIndex) + 1, int(term), isLeader
 }
 
 //

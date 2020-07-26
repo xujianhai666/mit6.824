@@ -363,6 +363,15 @@ func (cfg *config) checkNoLeader() {
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
 	var cmd interface{} = nil
+
+	//cfg.mu.Lock()
+	//for i := 0; i < len(cfg.rafts); i++ {
+	//	if len(cfg.logs[i]) > 0 {
+	//		DPrintf("[raft: %v] len : %v for index: %v end value: %#v", i, len(cfg.logs[i]), index, cfg.logs[i][len(cfg.logs[i])-1])
+	//	}
+	//}
+	//cfg.mu.Unlock()
+
 	for i := 0; i < len(cfg.rafts); i++ {
 		if cfg.applyErr[i] != "" {
 			cfg.t.Fatal(cfg.applyErr[i])
@@ -430,6 +439,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	t0 := time.Now()
 	starts := 0
+	DPrintf("begin round i:%v\n", cmd)
 	for time.Since(t0).Seconds() < 10 {
 		// try all the servers, maybe one is the leader.
 		index := -1
@@ -444,6 +454,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			if rf != nil {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
+					DPrintf("rf : %v start cmd: %v success\n", starts, cmd)
 					index = index1
 					break
 				}
