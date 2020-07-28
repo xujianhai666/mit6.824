@@ -383,7 +383,6 @@ func TestBackup2B(t *testing.T) {
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
 
-	Debug = 0
 	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
 
 	t.Log("success a random: round-0\n")
@@ -443,7 +442,6 @@ func TestBackup2B(t *testing.T) {
 
 	// lots of successful commands to new group.
 	t.Log("success lots of command: round-4\n")
-	Debug = 1
 	for i := 0; i < 50; i++ {
 		t.Logf("success lots of command: round-4 for i:%v\n", i)
 		cfg.one(rand.Int(), 3, true)
