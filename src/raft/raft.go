@@ -55,19 +55,26 @@ type LogEntry struct {
 }
 
 type _Role int32
+type _Reason int32
 
 const (
 	_Unknown _Role = iota
 	_Leader
 	_Follower
 	_Candidate
+
+	_SUCCESS _Reason = iota
+	_Voted
+	_TermLarge
+	_IndexLower
+	_TIMEOUT
 )
 
 const (
 	_ElectionTimeout      = 240 * time.Millisecond
-	_DeltaElectionTimeout = 100 * time.Millisecond
+	_DeltaElectionTimeout = 200 * time.Millisecond
 	_HeartbeatTimeout     = 120 * time.Millisecond
-	_NetworkTimeout       = 20 * time.Millisecond
+	_NetworkTimeout       = 50 * time.Millisecond
 )
 
 var (
@@ -273,7 +280,7 @@ func (rf *Raft) becomeCandidate() {
 		DPrintf("[me %v] elect timeout: %v with term: %v\n", rf.me, electTimeout, rf.currentTerm)
 
 		rf.currentTerm = rf.currentTerm + 1
-		if maxTerm > rf.currentTerm {
+		if maxTerm >= rf.currentTerm {
 			rf.currentTerm = maxTerm
 		}
 		rf.votedFor = rf.me
@@ -296,11 +303,14 @@ func (rf *Raft) becomeCandidate() {
 		quorum := int32(len(rf.peers)/2 + 1)
 		maxTerm = rf.currentTerm // pick maxTerm from peer for elect next round
 		rf.stateLock.Unlock()
+		wg := sync.WaitGroup{}
+		wg.Add(len(rf.peers))
 		for i, _ := range rf.peers {
 			if i == rf.me {
 				continue
 			}
 			go func(idx int) {
+				defer wg.Done()
 				reply := &RequestVoteReply{}
 				//DPrintf("[me: %v] send request with term: %v", rf.me, rf.currentTerm)
 				ok := rf.sendRequestVote(idx, req, reply)
@@ -319,15 +329,15 @@ func (rf *Raft) becomeCandidate() {
 					}
 
 					atomic.AddInt32(&count, 1)
-					success := count-granted >= quorum
-					if success {
-						DPrintf("sendRequestVote [me %v] get not granted: %v >= quorum", rf.me, granted)
+					failed := count-granted >= quorum
+					if failed {
+						DPrintf("sendRequestVote [me %v] get not granted: %v >= quorum", rf.me, count-granted)
 						// elect failed, so back to origin
 						rf.votedFor = -1
 						rf.stateLock.Unlock()
 						return
 					}
-					DPrintf("sendRequestVote [me %v] return false", rf.me)
+					//DPrintf("sendRequestVote [me %v] return false", rf.me)
 					rf.stateLock.Unlock()
 					return
 				}
@@ -367,6 +377,22 @@ func (rf *Raft) becomeCandidate() {
 				DPrintf("sendRequestVote [me %v] finish count: %v granted:%v", rf.me, count, granted)
 			}(i)
 		}
+		wg.Wait()
+
+		if rf.killed() {
+			rf.stateLock.Lock()
+			DPrintf("killed, [me %v] exist becomeCandidate", rf.me)
+			rf.stateLock.Unlock()
+			return
+		}
+
+		rf.stateLock.Lock()
+		if rf.role != _Candidate {
+			DPrintf("nonCandidate role: %v, [me %v] exist becomeCandidate", rf.role, rf.me)
+			rf.stateLock.Unlock()
+			return
+		}
+		rf.stateLock.Unlock()
 		time.Sleep(electTimeout)
 	}
 }
@@ -403,7 +429,7 @@ func (rf *Raft) persist() {
 	e.Encode(state)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	DPrintf("rf [me %v] save stateInfo: %#v", rf.me, state)
+	//DPrintf("rf [me %v] save stateInfo: %#v", rf.me, state)
 }
 
 //
@@ -460,8 +486,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.executeLock.Lock()
 	defer rf.executeLock.Unlock()
 
-	DPrintf("[ReceiveRequestVote] [me %v] from [peer %v] start", rf.me, args.CandidateId)
+	//DPrintf("[ReceiveRequestVote] [me %v] from [peer %v] start", rf.me, args.CandidateId)
 	rf.stateLock.Lock()
+	DPrintf("[ReceiveRequestVote] [me %v] log: %v term: %v from [peer %v] start", rf.me, len(rf.log), rf.currentTerm, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
@@ -480,6 +507,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 
 		if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
+			rf.votedFor = -1
 			rf.lastHeartbeat = time.Now()
 			DPrintf("[ReceiveRequestVote] [me %v] index is oldest, return", rf.me)
 			return
@@ -544,7 +572,7 @@ func (rf *Raft) heartbeat() bool {
 		preLogIndex = int32(len(rf.log) - 1)
 		preLogTerm = rf.log[preLogIndex].Term
 	}
-	appendReq := &AppendEntriesRequest{
+	appendReq := AppendEntriesRequest{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: preLogIndex,
@@ -554,7 +582,7 @@ func (rf *Raft) heartbeat() bool {
 	}
 	rf.stateLock.Unlock()
 
-	return rf.quorumHeartbeat(*appendReq)
+	return rf.quorumHeartbeat(appendReq)
 }
 
 func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
@@ -563,7 +591,7 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 	quorum := int32(len(rf.peers)/2 + 1)
 	waitCh := make(chan struct{}, len(rf.peers))
 	for i, _ := range rf.peers {
-		go func(idx int) {
+		go func(idx int, appendReq AppendEntriesRequest) {
 
 			for {
 
@@ -577,7 +605,16 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 				}
 
 				appendReply := &AppendEntriesResponse{}
-				ok := rf.sendAppendEntries(idx, &appendReq, appendReply)
+
+				r := &AppendEntriesRequest{
+					Term:         appendReq.Term,
+					LeaderId:     appendReq.LeaderId,
+					PrevLogIndex: appendReq.PrevLogIndex,
+					PrevLogTerm:  appendReq.PrevLogTerm,
+					Entries:      appendReq.Entries,
+					LeaderCommit: appendReq.LeaderCommit,
+				}
+				ok := rf.sendAppendEntries(idx, r, appendReply)
 				if !ok {
 					rf.stateLock.Lock()
 					atomic.AddInt32(&count, 1)
@@ -632,6 +669,7 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 				// TODO(zro.xu): term pointer is better
 				DPrintf("quorumHeartbeat resend from %v to %v indicator: %v", rf.me, idx, appendReply.LogIndexHint)
 				rf.nextIndex[idx] = appendReply.LogIndexHint + 1
+
 				appendReq.PrevLogTerm = rf.log[appendReply.LogIndexHint].Term
 				appendReq.PrevLogIndex = appendReply.LogIndexHint
 				appendReq.LeaderCommit = rf.commitIndex
@@ -651,7 +689,7 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 				return
 			}
 			rf.stateLock.Unlock()
-		}(i)
+		}(i, appendReq)
 	}
 	<-waitCh
 	rf.stateLock.Lock()

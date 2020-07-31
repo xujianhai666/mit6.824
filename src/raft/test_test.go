@@ -621,6 +621,7 @@ func TestPersist12C(t *testing.T) {
 }
 
 func TestPersist22C(t *testing.T) {
+	//Debug = 0
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -629,7 +630,7 @@ func TestPersist22C(t *testing.T) {
 
 	index := 1
 	for iters := 0; iters < 5; iters++ {
-		cfg.one(10+index, servers, true)
+		cfg.one(10+index, servers, true)  // 11
 		index++
 
 		leader1 := cfg.checkOneLeader()
@@ -637,13 +638,15 @@ func TestPersist22C(t *testing.T) {
 		cfg.disconnect((leader1 + 1) % servers)
 		cfg.disconnect((leader1 + 2) % servers)
 
-		cfg.one(10+index, servers-2, true)
+		cfg.one(10+index, servers-2, true)  // 12
 		index++
 
 		cfg.disconnect((leader1 + 0) % servers)
 		cfg.disconnect((leader1 + 3) % servers)
 		cfg.disconnect((leader1 + 4) % servers)
 
+		atomic.StoreInt32(&Debug, 1)
+		DPrintf("start with : %v", 10 + index)
 		cfg.start1((leader1 + 1) % servers)
 		cfg.start1((leader1 + 2) % servers)
 		cfg.connect((leader1 + 1) % servers)
@@ -654,8 +657,9 @@ func TestPersist22C(t *testing.T) {
 		cfg.start1((leader1 + 3) % servers)
 		cfg.connect((leader1 + 3) % servers)
 
-		cfg.one(10+index, servers-2, true)
+		cfg.one(10+index, servers-2, true)  // 13, 就三个
 		index++
+		DPrintf("end with : %v", 10 + index)
 
 		cfg.connect((leader1 + 4) % servers)
 		cfg.connect((leader1 + 0) % servers)
