@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"context"
 	"math/rand"
 	"sort"
@@ -26,6 +27,7 @@ import (
 )
 import "sync/atomic"
 import "../labrpc"
+import "../labgob"
 
 // import "bytes"
 // import "../labgob"
@@ -107,8 +109,14 @@ type Raft struct {
 	matchIndex []int32 // for each server, index of highest log entry known to be replicated on server
 }
 
+type StateInfo struct {
+	CurrentTerm int32
+	CommitIndex int32
+	LastApplied int32
+	Logs        []LogEntry
+}
+
 func (rf *Raft) run() {
-	rf.init()
 
 	go func() {
 		rf.stateLock.Lock()
@@ -137,17 +145,20 @@ func (rf *Raft) run() {
 			switch role {
 			case _Leader:
 				rf.stateLock.Lock()
+				//DPrintf("raft: [me %v] now is leader with state: %#v", rf.me, rf.log)
 				DPrintf("raft: [me %v] now is leader", rf.me)
 				rf.stateLock.Unlock()
 				go rf.becomeLeader()
 			case _Follower:
 				rf.stateLock.Lock()
+				//DPrintf("raft: [me %v] now is follower %#v", rf.me, rf.log)
 				DPrintf("raft: [me %v] now is follower", rf.me)
 				rf.stateLock.Unlock()
 				go rf.becomeFollower()
 			case _Candidate:
 				rf.stateLock.Lock()
-				DPrintf("raft: [me %v] now is candidate", rf.me)
+				//DPrintf("raft: [me %v] now is candidate %#v", rf.me, rf.log)
+				DPrintf("raft: [me %v] now is candidate", rf.me, )
 				rf.stateLock.Unlock()
 				go rf.becomeCandidate()
 			}
@@ -156,7 +167,7 @@ func (rf *Raft) run() {
 }
 
 func (rf *Raft) init() {
-	rf.stateLock.Lock()
+	//rf.stateLock.Lock()
 	rf.closeCh = make(chan struct{})
 	rf.roleCh = make(chan _Role)
 	// custom structure
@@ -166,7 +177,7 @@ func (rf *Raft) init() {
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.stateLock.Unlock()
+	//rf.stateLock.Unlock()
 }
 
 func (rf *Raft) becomeLeader() {
@@ -280,7 +291,6 @@ func (rf *Raft) becomeCandidate() {
 			LastLogTerm:  lastTerm,
 		}
 
-
 		count := int32(1)
 		granted := int32(1)
 		quorum := int32(len(rf.peers)/2 + 1)
@@ -307,7 +317,6 @@ func (rf *Raft) becomeCandidate() {
 						rf.stateLock.Unlock()
 						return
 					}
-
 
 					atomic.AddInt32(&count, 1)
 					success := count-granted >= quorum
@@ -383,12 +392,18 @@ func (rf *Raft) IsLeader() bool {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	//w := new(bytes.Buffer)
-	//e := labgob.NewEncoder(w)
-	//e.Encode(rf.xxx)
-	//e.Encode(rf.yyy)
-	//data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	state := &StateInfo{
+		CurrentTerm: rf.currentTerm,
+		CommitIndex: rf.commitIndex,
+		LastApplied: rf.lastApplied,
+		Logs:        rf.log,
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(state)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	DPrintf("rf [me %v] save stateInfo: %#v", rf.me, state)
 }
 
 //
@@ -400,17 +415,19 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	state := &StateInfo{}
+
+	if err := d.Decode(state); err != nil {
+		panic(err)
+	}
+	rf.currentTerm = state.CurrentTerm
+	rf.commitIndex = state.CommitIndex
+	rf.lastApplied = state.LastApplied
+	rf.log = state.Logs
+	DPrintf("rf [me %v] read stateInfo: %#v", rf.me, state)
 }
 
 //
@@ -597,9 +614,9 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 								CommandIndex: int(i),
 							}
 						}
+						rf.persist()
 					}
 					rf.stateLock.Unlock()
-					// 需要判断结果
 					break
 				}
 
@@ -618,6 +635,7 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 				appendReq.PrevLogTerm = rf.log[appendReply.LogIndexHint].Term
 				appendReq.PrevLogIndex = appendReply.LogIndexHint
 				appendReq.LeaderCommit = rf.commitIndex
+				appendReq.Entries = rf.log[appendReply.LogIndexHint+1:]
 				rf.stateLock.Unlock()
 			}
 
@@ -698,6 +716,7 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 							}
 						}
 						rf.lastApplied = rf.commitIndex
+						rf.persist()
 						// 发送 commitIndex 变更事件, 这里不需要
 					}
 					// 等待 commitIndex 到最新值
@@ -815,6 +834,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	rf.stateLock.Lock()
 	// use defer
 	reply.Term = rf.currentTerm
+	reply.LogIndexHint = -1
 
 	if rf.role == _Unknown {
 		DPrintf("[ReceiveAppendEntries] [me %v] is changing role", rf.me)
@@ -867,6 +887,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	}
 
 	if len(args.Entries) > 0 {
+		DPrintf("add entries from preIndex: %v", args.PrevLogIndex)
 		rf.log = rf.log[:args.PrevLogIndex+1]
 		for _, e := range args.Entries {
 			rf.log = append(rf.log, LogEntry{
@@ -892,6 +913,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		}
 		rf.lastApplied = i
 	}
+	//DPrintf("[me: %v]persist for appendEntries", rf.me)
+	rf.persist()
 	//rf.lastApplied = rf.commitIndex
 	rf.lastHeartbeat = time.Now()
 	reply.Success = true
@@ -936,6 +959,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 	}
 	rf.log = append(rf.log, newEntry)
+	//rf.persist()
 	rf.matchIndex[rf.me] = int32(len(rf.log) - 1)
 	entries := []LogEntry{newEntry}
 	appendReq := &AppendEntriesRequest{
@@ -971,7 +995,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	close(rf.closeCh)
-	// Your code here, if desired.
+	rf.stateLock.Lock()
+	defer rf.stateLock.Unlock()
+	rf.persist()
 }
 
 func (rf *Raft) killed() bool {
@@ -1001,6 +1027,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
+	rf.init()
 	rf.readPersist(persister.ReadRaftState())
 	go rf.run()
 	DPrintf("Success make")

@@ -577,6 +577,7 @@ func TestPersist12C(t *testing.T) {
 	cfg.begin("Test (2C): basic persistence")
 
 	cfg.one(11, servers, true)
+	DPrintf("ONE 11 successs")
 
 	// crash and re-start all
 	for i := 0; i < servers; i++ {
@@ -589,10 +590,14 @@ func TestPersist12C(t *testing.T) {
 
 	cfg.one(12, servers, true)
 
+	DPrintf("ONE SUCCESS")
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	DPrintf("disconnect SUCCESS")
 	cfg.start1(leader1)
+	DPrintf("START1 SUCCESS")
 	cfg.connect(leader1)
+	DPrintf("connect SUCCESS")
 
 	cfg.one(13, servers, true)
 
