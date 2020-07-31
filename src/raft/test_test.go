@@ -645,7 +645,7 @@ func TestPersist22C(t *testing.T) {
 		cfg.disconnect((leader1 + 3) % servers)
 		cfg.disconnect((leader1 + 4) % servers)
 
-		atomic.StoreInt32(&Debug, 1)
+		//atomic.StoreInt32(&Debug, 1)
 		DPrintf("start with : %v", 10 + index)
 		cfg.start1((leader1 + 1) % servers)
 		cfg.start1((leader1 + 2) % servers)

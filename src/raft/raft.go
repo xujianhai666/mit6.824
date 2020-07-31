@@ -72,9 +72,9 @@ const (
 
 const (
 	_ElectionTimeout      = 240 * time.Millisecond
-	_DeltaElectionTimeout = 200 * time.Millisecond
+	_DeltaElectionTimeout = 240 * time.Millisecond
 	_HeartbeatTimeout     = 120 * time.Millisecond
-	_NetworkTimeout       = 50 * time.Millisecond
+	_NetworkTimeout       = 20 * time.Millisecond
 )
 
 var (
@@ -259,6 +259,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.stateLock.Unlock()
 	var (
 		maxTerm = int32(0)
+		maxLog  = int32(len(rf.log) - 1)
 	)
 
 	for {
@@ -276,13 +277,10 @@ func (rf *Raft) becomeCandidate() {
 			return
 		}
 
-		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
-		DPrintf("[me %v] elect timeout: %v with term: %v\n", rf.me, electTimeout, rf.currentTerm)
-
 		rf.currentTerm = rf.currentTerm + 1
-		if maxTerm >= rf.currentTerm {
-			rf.currentTerm = maxTerm
-		}
+		//if maxTerm >= rf.currentTerm {
+		//	rf.currentTerm = maxTerm
+		//}
 		rf.votedFor = rf.me
 
 		lastTerm := int32(0)
@@ -358,6 +356,10 @@ func (rf *Raft) becomeCandidate() {
 				atomic.AddInt32(&count, 1)
 				if ok && reply.VoteGranted {
 					atomic.AddInt32(&granted, 1)
+				} else {
+					if maxLog < reply.LastLog {
+						maxLog = reply.LastLog
+					}
 				}
 
 				if granted >= quorum {
@@ -392,6 +394,14 @@ func (rf *Raft) becomeCandidate() {
 			rf.stateLock.Unlock()
 			return
 		}
+		if maxTerm >= rf.currentTerm {
+			rf.currentTerm = maxTerm
+		}
+		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
+		if maxLog > int32(len(rf.log) - 1) {
+			electTimeout = 	2 * _ElectionTimeout
+		}
+		DPrintf("[me %v] elect timeout: %v with term: %v\n", rf.me, electTimeout, rf.currentTerm)
 		rf.stateLock.Unlock()
 		time.Sleep(electTimeout)
 	}
@@ -476,6 +486,7 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int32 // currentTerm, for candidate to update itself
 	VoteGranted bool  // true means candidate received vote
+	LastLog     int32 // last log index
 }
 
 //
@@ -491,6 +502,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("[ReceiveRequestVote] [me %v] log: %v term: %v from [peer %v] start", rf.me, len(rf.log), rf.currentTerm, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
+	reply.LastLog = int32(len(rf.log) - 1)
 	if args.Term < rf.currentTerm {
 		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v <= currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.stateLock.Unlock()
@@ -702,8 +714,12 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 	success := int32(1)
 	quorum := int32(len(rf.peers)/2 + 1)
 	waitCh := make(chan struct{}, len(rf.peers))
+	wg := sync.WaitGroup{}
+	wg.Add(len(rf.peers))
+	//start := time.Now()
 	for i, _ := range rf.peers {
 		go func(idx int, appendReq AppendEntriesRequest) {
+			defer wg.Done()
 			for { // retry fro log inconsistency
 
 				if idx == rf.me {
@@ -816,6 +832,11 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 		}(i, req)
 	}
 	<-waitCh
+	wg.Wait()
+	//gap := time.Since(start)
+	//if gap < _HeartbeatTimeout {
+	//time.Sleep(_HeartbeatTimeout)
+	//}
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
 	return success >= quorum
@@ -841,7 +862,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 
 func (rf *Raft) monitorLeader() {
 	for {
-		//DPrintf("[monitorLeader] [me %v] monitor leader", rf.me)
 		if rf.killed() {
 			return
 		}
@@ -857,8 +877,9 @@ func (rf *Raft) monitorLeader() {
 			rf.roleCh <- _Candidate
 			return
 		}
+		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
 		rf.stateLock.Unlock()
-		time.Sleep(_ElectionTimeout)
+		time.Sleep(electTimeout)
 	}
 }
 

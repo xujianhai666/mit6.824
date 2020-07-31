@@ -6,8 +6,8 @@ import (
 )
 
 //Debugging
-var Debug = int32(0)
-//var Debug = 1
+//var Debug = int32(0)
+var Debug = int32(1)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	//if Debug > 0 {
