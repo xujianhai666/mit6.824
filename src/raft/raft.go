@@ -182,7 +182,6 @@ func (rf *Raft) run() {
 }
 
 func (rf *Raft) init() {
-	//rf.stateLock.Lock()
 	rf.closeCh = make(chan struct{})
 	rf.roleCh = make(chan _Role)
 	// custom structure
@@ -192,7 +191,6 @@ func (rf *Raft) init() {
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	//rf.stateLock.Unlock()
 }
 
 func (rf *Raft) becomeLeader() {
@@ -264,6 +262,7 @@ func (rf *Raft) becomeFollower() {
 // becomeCandidate turn to be candidate, try to elect to be leader.
 // WARNING: elect a new leader within five seconds of the failure of the old leader, raft mentions
 // election timeouts in the range of 150 to 300 milliseconds.  tester limits you to 10 heartbeats per second.
+// TODO: 允许多个 状态并行
 func (rf *Raft) becomeCandidate() {
 	rf.stateLock.Lock()
 	if rf.role == _Candidate || rf.killed() {
@@ -294,9 +293,6 @@ func (rf *Raft) becomeCandidate() {
 		}
 
 		rf.currentTerm = rf.currentTerm + 1
-		//if maxTerm >= rf.currentTerm {
-		//	rf.currentTerm = maxTerm
-		//}
 		rf.votedFor = rf.me
 
 		lastTerm := int32(0)
@@ -328,69 +324,24 @@ func (rf *Raft) becomeCandidate() {
 				reply := &RequestVoteReply{}
 				//DPrintf("[me: %v] send request with term: %v", rf.me, rf.currentTerm)
 				ok := rf.sendRequestVote(idx, req, reply)
-				if !ok {
-					rf.stateLock.Lock()
-					if req.Term != rf.currentTerm {
-						DPrintf("sendRequestVote [me %v] Term != rf.currentTerm", rf.me)
-						rf.stateLock.Unlock()
-						return
-					}
-
-					if atomic.LoadInt32(&rf.isLeader) == 1 {
-						DPrintf("sendRequestVote [me %v] rf.isLeader==1", rf.me)
-						rf.stateLock.Unlock()
-						return
-					}
-
-					atomic.AddInt32(&count, 1)
-					failed := count-granted >= quorum
-					if failed {
-						DPrintf("sendRequestVote [me %v] get not granted: %v >= quorum", rf.me, count-granted)
-						// elect failed, so back to origin
-						rf.votedFor = -1
-						rf.stateLock.Unlock()
-						return
-					}
-					//DPrintf("sendRequestVote [me %v] return false", rf.me)
-					rf.stateLock.Unlock()
-					return
-				}
 
 				rf.stateLock.Lock()
 				defer rf.stateLock.Unlock()
 
-				if req.Term != rf.currentTerm {
-					DPrintf("sendRequestVote [me %v] Term != rf.currentTerm", rf.me)
-					return
-				}
-
-				if atomic.LoadInt32(&rf.isLeader) == 1 {
-					DPrintf("sendRequestVote [me %v] rf.isLeader==1", rf.me)
-					return
-				}
-
 				atomic.AddInt32(&count, 1)
-				if ok && reply.VoteGranted {
+				if !ok {
+					return
+				}
+
+				if reply.VoteGranted {
 					atomic.AddInt32(&granted, 1)
 				} else {
 					if maxLog < reply.LastLog {
 						maxLog = reply.LastLog
 					}
-				}
-
-				if granted >= quorum {
-					DPrintf("sendRequestVote [me %v] get granted >= quorum", rf.me)
-					rf.roleCh <- _Leader
-					return
-				}
-				if count-granted >= quorum {
-					DPrintf("sendRequestVote [me %v] get not granted >= quorum", rf.me)
-					// elect failed, so back to origin
-					rf.votedFor = -1
-					return
-				}
-				if maxTerm < reply.Term {
-					maxTerm = reply.Term + 1
+					if maxTerm < reply.Term {
+						maxTerm = reply.Term + 1
+					}
 				}
 				DPrintf("sendRequestVote [me %v] finish count: %v granted:%v", rf.me, count, granted)
 			}(i)
@@ -410,9 +361,29 @@ func (rf *Raft) becomeCandidate() {
 			rf.stateLock.Unlock()
 			return
 		}
-		if maxTerm >= rf.currentTerm {
+
+		// 最大term判断, handler 也可能触发变化
+		if maxTerm > rf.currentTerm {
+			rf.votedFor = -1
 			rf.currentTerm = maxTerm
+			rf.stateLock.Unlock()
+			rf.roleCh <- _Follower  // 这里的顺序需要调整
+			return
 		}
+
+		if granted >= quorum {
+			DPrintf("sendRequestVote [me %v] get granted >= quorum", rf.me)
+			rf.stateLock.Unlock()
+			rf.roleCh <- _Leader
+			return
+		}
+
+		if count-granted >= quorum {
+			DPrintf("sendRequestVote [me %v] get not granted >= quorum", rf.me)
+			// elect failed, so back to origin
+			rf.votedFor = -1
+		}
+
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
 		if maxLog > int32(len(rf.log)-1) {
 			DPrintf("maxLog triggered\n")
@@ -520,17 +491,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//DPrintf("[ReceiveRequestVote] [me %v] from [peer %v] start", rf.me, args.CandidateId)
 	rf.stateLock.Lock()
+	defer rf.stateLock.Unlock()
 	DPrintf("[ReceiveRequestVote] [me %v] log: %v term: %v from [peer %v] start", rf.me, len(rf.log), rf.currentTerm, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	reply.LastLog = int32(len(rf.log) - 1)
 	if args.Term < rf.currentTerm {
 		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v <= currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-		rf.stateLock.Unlock()
 		return
 	}
 
-	defer rf.stateLock.Unlock()
+	if args.Term > rf.currentTerm && rf.role != _Follower {
+		rf.currentTerm = args.Term
+		rf.roleCh <- _Follower  // maybe bug
+		return
+	}
+
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastLogIndex := int32(0)
 		lastLogTerm := int32(0)
@@ -623,9 +599,11 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 	success := int32(1)
 	quorum := int32(len(rf.peers)/2 + 1)
 	waitCh := make(chan struct{}, len(rf.peers))
+	wg := sync.WaitGroup{}
+	wg.Add(len(rf.peers))
 	for i, _ := range rf.peers {
 		go func(idx int, appendReq AppendEntriesRequest) {
-
+			defer wg.Done()
 			for {
 
 				if idx == rf.me {
@@ -693,6 +671,7 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 				rf.stateLock.Lock()
 				if rf.currentTerm < appendReply.Term {
 					DPrintf("quorumHeartbeat leader %v term is lower", rf.me)
+					rf.currentTerm = appendReply.Term
 					rf.stateLock.Unlock()
 					rf.roleCh <- _Follower
 					waitCh <- struct{}{}
@@ -725,8 +704,12 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 		}(i, appendReq)
 	}
 	<-waitCh
+	wg.Wait()
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
+	if appendReq.Term != rf.currentTerm {
+		return false
+	}
 	return atomic.LoadInt32(&success) >= quorum
 }
 
@@ -854,10 +837,6 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 	}
 	<-waitCh
 	wg.Wait()
-	//gap := time.Since(start)
-	//if gap < _HeartbeatTimeout {
-	//time.Sleep(_HeartbeatTimeout)
-	//}
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
 	return success >= quorum
