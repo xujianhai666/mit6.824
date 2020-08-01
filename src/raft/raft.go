@@ -246,7 +246,7 @@ func (rf *Raft) becomeLeader() {
 
 func (rf *Raft) becomeFollower() {
 	rf.stateLock.Lock()
-	if rf.role == _Follower {
+	if rf.role == _Follower || rf.killed() {
 		rf.stateLock.Unlock()
 		return
 	}
