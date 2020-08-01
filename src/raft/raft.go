@@ -22,11 +22,11 @@ import (
 	"context"
 	"math/rand"
 	"net/http"
+	_ "net/http/pprof"
 	"runtime"
 	"sort"
 	"sync"
 	"time"
-	_ "net/http/pprof"
 )
 import "sync/atomic"
 import "../labrpc"
@@ -240,7 +240,11 @@ func (rf *Raft) becomeLeader() {
 			rf.lastHeartbeat = now
 			rf.stateLock.Unlock()
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-time.NewTimer(20 * time.Millisecond).C:
+		case <-rf.closeCh:
+			return
+		}
 	}
 }
 
@@ -416,7 +420,11 @@ func (rf *Raft) becomeCandidate() {
 		}
 		DPrintf("[me %v] elect timeout: %v with term: %v\n", rf.me, electTimeout, rf.currentTerm)
 		rf.stateLock.Unlock()
-		time.Sleep(electTimeout)
+		select {
+		case <-time.NewTimer(electTimeout).C:
+		case <-rf.closeCh:
+			return
+		}
 	}
 }
 
@@ -892,7 +900,11 @@ func (rf *Raft) monitorLeader() {
 		}
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
 		rf.stateLock.Unlock()
-		time.Sleep(electTimeout)
+		select {
+		case <-time.NewTimer(electTimeout).C:
+		case <-rf.closeCh:
+			return
+		}
 	}
 }
 
