@@ -71,8 +71,8 @@ const (
 )
 
 const (
-	_ElectionTimeout      = 240 * time.Millisecond
-	_DeltaElectionTimeout = 240 * time.Millisecond
+	_ElectionTimeout      = 200 * time.Millisecond
+	_DeltaElectionTimeout = 200 * time.Millisecond
 	_HeartbeatTimeout     = 120 * time.Millisecond
 	_NetworkTimeout       = 20 * time.Millisecond
 )
@@ -110,10 +110,13 @@ type Raft struct {
 	lastApplied   int32 // index of highest log entry applied to state machine
 	lastHeartbeat time.Time
 	executeLock   sync.Mutex // use lock to keep fifo, reduce code len
+	epoch         int32
+	epochCh       chan struct{}
 
 	// leader info
 	nextIndex  []int32 // for each server, index of the next log entry to send to that server
 	matchIndex []int32 // for each server, index of highest log entry known to be replicated on server
+
 }
 
 type StateInfo struct {
@@ -129,6 +132,7 @@ func (rf *Raft) run() {
 		rf.stateLock.Lock()
 		if rf.role == _Unknown {
 			DPrintf("become candidate: [me %v] initially", rf.me)
+			atomic.AddInt32(&rf.epoch, 1)
 			rf.roleCh <- _Candidate
 		}
 		rf.stateLock.Unlock()
@@ -302,7 +306,7 @@ func (rf *Raft) becomeCandidate() {
 		maxTerm = rf.currentTerm // pick maxTerm from peer for elect next round
 		rf.stateLock.Unlock()
 		wg := sync.WaitGroup{}
-		wg.Add(len(rf.peers))
+		wg.Add(len(rf.peers) - 1)
 		for i, _ := range rf.peers {
 			if i == rf.me {
 				continue
@@ -398,8 +402,9 @@ func (rf *Raft) becomeCandidate() {
 			rf.currentTerm = maxTerm
 		}
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
-		if maxLog > int32(len(rf.log) - 1) {
-			electTimeout = 	2 * _ElectionTimeout
+		if maxLog > int32(len(rf.log)-1) {
+			DPrintf("maxLog triggered\n")
+			electTimeout = 2 * _ElectionTimeout
 		}
 		DPrintf("[me %v] elect timeout: %v with term: %v\n", rf.me, electTimeout, rf.currentTerm)
 		rf.stateLock.Unlock()
