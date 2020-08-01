@@ -21,9 +21,12 @@ import (
 	"bytes"
 	"context"
 	"math/rand"
+	"net/http"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
+	_ "net/http/pprof"
 )
 import "sync/atomic"
 import "../labrpc"
@@ -146,6 +149,7 @@ func (rf *Raft) run() {
 		select {
 		case <-rf.closeCh:
 			rf.stateLock.Lock()
+			atomic.AddInt32(&rf.epoch, 1)
 			DPrintf("raft: %v closed, so exist", rf.me)
 			rf.stateLock.Unlock()
 			return
@@ -258,6 +262,10 @@ func (rf *Raft) becomeFollower() {
 // election timeouts in the range of 150 to 300 milliseconds.  tester limits you to 10 heartbeats per second.
 func (rf *Raft) becomeCandidate() {
 	rf.stateLock.Lock()
+	if rf.role == _Candidate || rf.killed() {
+		rf.stateLock.Unlock()
+		return
+	}
 	rf.role = _Candidate
 	atomic.StoreInt32(&rf.isLeader, 0)
 	rf.stateLock.Unlock()
@@ -1096,4 +1104,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.run()
 	DPrintf("Success make")
 	return rf
+}
+
+func init() {
+	runtime.SetBlockProfileRate(500 * 1000 * 1000)
+	runtime.SetMutexProfileFraction(500 * 1000 * 1000)
+
+	http.ListenAndServe(":8088", nil)
 }
