@@ -341,7 +341,7 @@ loop:
 }
 
 func TestRejoin2B(t *testing.T) {
-	Debug = 0
+	//Debug = 0
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -369,8 +369,8 @@ func TestRejoin2B(t *testing.T) {
 	// old leader connected again
 	cfg.connect(leader1)
 
-	Debug = 1
-	DPrintf("start 104")
+	//Debug = 1
+	//DPrintf("start 104")
 	cfg.one(104, 2, true)
 
 	// all together now
@@ -720,15 +720,19 @@ func TestFigure82C(t *testing.T) {
 
 	cfg.begin("Test (2C): Figure 8")
 
+	index := 0
 	cfg.one(rand.Int(), 1, true)
+	index = index + 1
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
+				// entries 需要保持一致. 后退的兼容性
 				_, _, ok := cfg.rafts[i].Start(rand.Int())
 				if ok {
+					DPrintf("success for index : %v", index)
 					leader = i
 				}
 			}

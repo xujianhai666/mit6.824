@@ -163,9 +163,6 @@ func (rf *Raft) becomeLeader() { // add term param
 	rf.matchIndex = make([]int32, len(rf.peers)) // (initialized to 0, increases monotonically)
 
 	lastLogIndex := rf.commitIndex
-	//if len(rf.log) > 1 {
-	//	lastLogIndex = int32(len(rf.log) - 1)
-	//}
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = lastLogIndex + 1
 	}
@@ -686,6 +683,11 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 	for i, _ := range rf.peers {
 		go func(idx int, appendReq AppendEntriesRequest) {
 			defer wg.Done()
+			rf.stateLock.Lock()
+			appendReq.PrevLogIndex = rf.nextIndex[idx] - 1
+			appendReq.PrevLogTerm = rf.log[appendReq.PrevLogIndex].Term
+			appendReq.Entries = rf.log[rf.nextIndex[idx]:]
+			rf.stateLock.Unlock()
 			for { // retry fro log inconsistency
 
 				if idx == rf.me {
@@ -910,6 +912,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		return
 	}
 
+	// 避免重复apply
 	if len(args.Entries) > 0 {
 		DPrintf("add entries from preIndex: %v", args.PrevLogIndex)
 		rf.log = rf.log[:args.PrevLogIndex+1]
@@ -986,7 +989,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//rf.persist()
 	rf.matchIndex[rf.me] = int32(len(rf.log) - 1)
 	entries := []LogEntry{newEntry}
-	appendReq := &AppendEntriesRequest{
+	appendReq := AppendEntriesRequest{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: preLogIndex, // change
@@ -996,7 +999,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.stateLock.Unlock()
 
-	quorumAck := rf.quorumSendAppendEntries(*appendReq)
+	quorumAck := rf.quorumSendAppendEntries(appendReq)
 	if !quorumAck {
 		return int(preLogIndex) + 1, int(term), true
 	}
