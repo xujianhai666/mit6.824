@@ -7,11 +7,12 @@ import (
 	_ "net/http/pprof"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"../labgob"
+	"../labrpc"
 )
-import "sync/atomic"
-import "../labrpc"
-import "../labgob"
 
 type ApplyMsg struct {
 	CommandValid bool
@@ -55,6 +56,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 	closeCh   chan struct{}       // close by Kill()
+	deadCh    chan struct{}
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -74,6 +76,7 @@ type Raft struct {
 	lastApplied   int32 // index of highest log entry applied to state machine
 	lastHeartbeat time.Time
 	executeLock   sync.Mutex // use lock to keep fifo, reduce code len
+	exitWg        sync.WaitGroup
 
 	// leader info
 	nextIndex  []int32 // for each server, index of the next log entry to send to that server
@@ -89,21 +92,24 @@ type StateInfo struct {
 }
 
 func (rf *Raft) run() {
+	defer close(rf.deadCh)
 
+	rf.exitWg.Add(1)
 	go func() {
+		defer rf.exitWg.Done()
 		rf.stateLock.Lock()
 		if rf.role == _Unknown {
 			DPrintf("become candidate: [me %v] initially", rf.me)
-			rf.roleCh <- _Candidate
+			select {
+			case <-rf.closeCh:
+				return
+			case rf.roleCh <- _Candidate:
+			}
 		}
 		rf.stateLock.Unlock()
 	}()
 
 	for {
-		if rf.killed() {
-			return
-		}
-
 		select {
 		case <-rf.closeCh:
 			rf.stateLock.Lock()
@@ -120,17 +126,19 @@ func (rf *Raft) run() {
 				DPrintf("raft: [me %v] now is leader with state: %#v", rf.me, rf.log)
 				//DPrintf("raft: [me %v] now is leader", rf.me)
 				rf.stateLock.Unlock()
+				rf.exitWg.Add(1)
 				go rf.becomeLeader()
 			case _Follower:
 				rf.stateLock.Lock()
 				//DPrintf("raft: [me %v] now is follower %#v", rf.me, rf.log)
 				DPrintf("raft: [me %v] now is follower", rf.me)
 				rf.stateLock.Unlock()
+				rf.exitWg.Add(1)
 				go rf.becomeFollower()
 			case _Candidate:
 				rf.stateLock.Lock()
 				//DPrintf("raft: [me %v] now is candidate %#v", rf.me, rf.log)
-				DPrintf("raft: [me %v] now is candidate", rf.me, )
+				DPrintf("raft: [me %v] now is candidate", rf.me)
 				rf.stateLock.Unlock()
 				go rf.becomeCandidate()
 			}
@@ -140,6 +148,7 @@ func (rf *Raft) run() {
 
 func (rf *Raft) init() {
 	rf.closeCh = make(chan struct{})
+	rf.deadCh = make(chan struct{})
 	rf.roleCh = make(chan _Role)
 	// custom structure
 	rf.currentTerm = 0
@@ -152,6 +161,7 @@ func (rf *Raft) init() {
 }
 
 func (rf *Raft) becomeLeader() { // add term param
+	defer rf.exitWg.Done()
 	rf.stateLock.Lock()
 	if rf.role == _Leader || rf.killed() {
 		rf.stateLock.Unlock()
@@ -202,6 +212,7 @@ func (rf *Raft) becomeLeader() { // add term param
 }
 
 func (rf *Raft) becomeFollower() {
+	defer rf.exitWg.Done()
 	rf.stateLock.Lock()
 	if rf.role == _Follower || rf.killed() {
 		rf.stateLock.Unlock()
@@ -211,6 +222,7 @@ func (rf *Raft) becomeFollower() {
 	atomic.StoreInt32(&rf.isLeader, 0)
 	rf.lastHeartbeat = time.Now()
 	rf.stateLock.Unlock()
+	rf.exitWg.Add(1)
 	go rf.monitorLeader()
 }
 
@@ -320,14 +332,22 @@ func (rf *Raft) becomeCandidate() {
 			rf.currentTerm = maxTerm
 			rf.role = _Unknown
 			rf.stateLock.Unlock()
-			rf.roleCh <- _Follower // 这里的顺序需要调整
+			select {
+			case <-rf.closeCh:
+				return
+			case rf.roleCh <- _Follower:
+			}
 			return
 		}
 
 		if granted >= quorum {
 			DPrintf("sendRequestVote [me %v] get granted >= quorum", rf.me)
 			rf.stateLock.Unlock()
-			rf.roleCh <- _Leader
+			select {
+			case <-rf.closeCh:
+				return
+			case rf.roleCh <- _Leader:
+			}
 			return
 		}
 
@@ -338,7 +358,7 @@ func (rf *Raft) becomeCandidate() {
 		}
 
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
-		if maxLog > int32(len(rf.log) - 1) {
+		if maxLog > int32(len(rf.log)-1) {
 			DPrintf("maxLog triggered\n")
 			electTimeout = 2 * _ElectionTimeout
 		}
@@ -461,7 +481,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.role = _Unknown
 		rf.stateLock.Unlock()
-		rf.roleCh <- _Follower // maybe bug
+		select {
+		case <-rf.closeCh:
+			return
+		case rf.roleCh <- _Follower:
+		}
 		return
 	}
 
@@ -486,7 +510,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			DPrintf("[ReceiveRequestVote] [me %v] become follower", rf.me)
 			rf.role = _Unknown
 			rf.stateLock.Unlock()
-			rf.roleCh <- _Follower
+			select {
+			case <-rf.closeCh:
+				return
+			case rf.roleCh <- _Follower:
+			}
 			return
 		}
 		reply.VoteGranted = true
@@ -633,7 +661,11 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 					DPrintf("quorumHeartbeat leader %v term is lower", rf.me)
 					rf.currentTerm = appendReply.Term
 					rf.stateLock.Unlock()
-					rf.roleCh <- _Follower
+					select {
+					case <-rf.closeCh:
+						return
+					case rf.roleCh <- _Follower:
+					}
 					waitCh <- struct{}{}
 					return
 				}
@@ -789,7 +821,11 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 	if maxTerm > rf.currentTerm {
 		rf.currentTerm = maxTerm
 		rf.stateLock.Unlock()
-		rf.roleCh <- _Follower
+		select {
+		case <-rf.closeCh:
+			return false
+		case rf.roleCh <- _Follower:
+		}
 		return false
 	}
 
@@ -821,11 +857,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 	}
 }
 
+// TODO: zero.xu 做成常规 goroutine
 func (rf *Raft) monitorLeader() {
+	defer rf.exitWg.Done()
 	for {
-		if rf.killed() {
-			return
-		}
 		rf.stateLock.Lock()
 		if rf.role != _Follower {
 			DPrintf("[monitorLeader] [me %v] exit due to role: %v", rf.me, rf.role)
@@ -835,7 +870,11 @@ func (rf *Raft) monitorLeader() {
 		if time.Since(rf.lastHeartbeat) > _ElectionTimeout {
 			DPrintf("lastHeartbeat [me %v] is timeout, so change to candidate", rf.me)
 			rf.stateLock.Unlock()
-			rf.roleCh <- _Candidate
+			select {
+			case <-rf.closeCh:
+				return
+			case rf.roleCh <- _Candidate:
+			}
 			return
 		}
 		//electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
@@ -882,7 +921,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 			DPrintf("[ReceiveAppendEntries] [me %v] term conflict", rf.me)
 			rf.role = _Unknown
 			rf.stateLock.Unlock()
-			rf.roleCh <- _Follower
+			select {
+			case <-rf.closeCh:
+				return
+			case rf.roleCh <- _Follower:
+			}
+
 			return
 		case args.Term > rf.currentTerm:
 			DPrintf("[ReceiveAppendEntries] [me %v] role is leader, receive high term, so convert to follower", rf.me)
@@ -894,7 +938,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 			}
 			rf.persist()
 			rf.stateLock.Unlock()
-			rf.roleCh <- _Follower
+			select {
+			case <-rf.closeCh:
+				return
+			case rf.roleCh <- _Follower:
+			}
 			return
 		}
 	}
@@ -911,7 +959,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		if len(args.Entries) == 0 {
 			reply.Success = true // 心跳才需要true
 		}
-		rf.roleCh <- _Follower
+		select {
+		case <-rf.closeCh:
+			return
+		case rf.roleCh <- _Follower:
+		}
 		return
 	}
 
@@ -1041,9 +1093,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	close(rf.closeCh)
+	<-rf.deadCh
+
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
 	rf.persist()
+	rf.exitWg.Wait()
 }
 
 func (rf *Raft) killed() bool {
@@ -1069,7 +1124,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.stateMachine = applyCh
-
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
