@@ -252,12 +252,14 @@ func (rf *Raft) becomeCandidate() {
 		rf.currentTerm = rf.currentTerm + 1
 		rf.votedFor = rf.me
 
-		lastTerm := int32(0)
-		lastLogIndex := int32(0)
-		if len(rf.log) > 1 {
-			lastLogIndex = int32(len(rf.log) - 1)
-			lastTerm = rf.log[lastLogIndex].Term
-		}
+		lastLogIndex := rf.commitIndex
+		lastTerm := rf.log[rf.commitIndex].Term
+		//lastTerm := int32(0)
+		//lastLogIndex := int32(0)
+		//if len(rf.log) > 1 {
+		//	lastLogIndex = int32(len(rf.log) - 1)
+		//	lastTerm = rf.log[lastLogIndex].Term
+		//}
 		req := &RequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
@@ -461,27 +463,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > rf.currentTerm && rf.role != _Follower {
+		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v (non-follower) > currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.currentTerm = args.Term
 		rf.role = _Unknown
-		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v (non-follower) > currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.stateLock.Unlock()
 		rf.roleCh <- _Follower // maybe bug
 		return
 	}
 
-	//defer rf.stateLock.Unlock()
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		lastLogIndex := int32(0)
-		lastLogTerm := int32(0)
-		if len(rf.log) > 1 {
-			lastLogIndex = int32(len(rf.log) - 1)
-			lastLogTerm = rf.log[lastLogIndex].Term
-		}
+		lastLogIndex := rf.commitIndex
+		lastLogTerm := rf.log[rf.commitIndex].Term
+		//lastLogIndex := int32(0)
+		//lastLogTerm := int32(0)
+		//if len(rf.log) > 1 {
+		//	lastLogIndex = int32(len(rf.log) - 1)
+		//	lastLogTerm = rf.log[lastLogIndex].Term
+		//}
 
 		if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 			rf.votedFor = -1
 			rf.lastHeartbeat = time.Now()
-			DPrintf("[ReceiveRequestVote] [me %v] index is oldest, return", rf.me)
+			DPrintf("[ReceiveRequestVote] [me %v] index from [%v] is oldest, return", rf.me, args.CandidateId)
 			rf.stateLock.Unlock()
 			return
 		}
