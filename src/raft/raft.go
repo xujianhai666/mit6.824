@@ -1,29 +1,10 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, Term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (Term, isLeader)
-//   ask a Raft for its current Term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
-//
-
 import (
 	"bytes"
 	"context"
 	"math/rand"
-	"net/http"
 	_ "net/http/pprof"
-	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -32,20 +13,6 @@ import "sync/atomic"
 import "../labrpc"
 import "../labgob"
 
-// import "bytes"
-// import "../labgob"
-
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -65,12 +32,6 @@ const (
 	_Leader
 	_Follower
 	_Candidate
-
-	_SUCCESS _Reason = iota
-	_Voted
-	_TermLarge
-	_IndexLower
-	_TIMEOUT
 )
 
 const (
@@ -113,8 +74,6 @@ type Raft struct {
 	lastApplied   int32 // index of highest log entry applied to state machine
 	lastHeartbeat time.Time
 	executeLock   sync.Mutex // use lock to keep fifo, reduce code len
-	epoch         int32
-	epochCh       chan struct{}
 
 	// leader info
 	nextIndex  []int32 // for each server, index of the next log entry to send to that server
@@ -135,7 +94,6 @@ func (rf *Raft) run() {
 		rf.stateLock.Lock()
 		if rf.role == _Unknown {
 			DPrintf("become candidate: [me %v] initially", rf.me)
-			atomic.AddInt32(&rf.epoch, 1)
 			rf.roleCh <- _Candidate
 		}
 		rf.stateLock.Unlock()
@@ -149,7 +107,6 @@ func (rf *Raft) run() {
 		select {
 		case <-rf.closeCh:
 			rf.stateLock.Lock()
-			atomic.AddInt32(&rf.epoch, 1)
 			DPrintf("raft: %v closed, so exist", rf.me)
 			rf.stateLock.Unlock()
 			return
@@ -193,7 +150,7 @@ func (rf *Raft) init() {
 	rf.lastApplied = 0
 }
 
-func (rf *Raft) becomeLeader() {
+func (rf *Raft) becomeLeader() { // add term param
 	rf.stateLock.Lock()
 	if rf.role == _Leader || rf.killed() {
 		rf.stateLock.Unlock()
@@ -366,8 +323,9 @@ func (rf *Raft) becomeCandidate() {
 		if maxTerm > rf.currentTerm {
 			rf.votedFor = -1
 			rf.currentTerm = maxTerm
+			rf.role = _Unknown
 			rf.stateLock.Unlock()
-			rf.roleCh <- _Follower  // 这里的顺序需要调整
+			rf.roleCh <- _Follower // 这里的顺序需要调整
 			return
 		}
 
@@ -491,22 +449,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//DPrintf("[ReceiveRequestVote] [me %v] from [peer %v] start", rf.me, args.CandidateId)
 	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
+
 	DPrintf("[ReceiveRequestVote] [me %v] log: %v term: %v from [peer %v] start", rf.me, len(rf.log), rf.currentTerm, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	reply.LastLog = int32(len(rf.log) - 1)
 	if args.Term < rf.currentTerm {
 		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v <= currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+		rf.stateLock.Unlock()
 		return
 	}
 
 	if args.Term > rf.currentTerm && rf.role != _Follower {
 		rf.currentTerm = args.Term
-		rf.roleCh <- _Follower  // maybe bug
+		rf.role = _Unknown
+		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v (non-follower) > currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+		rf.stateLock.Unlock()
+		rf.roleCh <- _Follower // maybe bug
 		return
 	}
 
+	//defer rf.stateLock.Unlock()
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastLogIndex := int32(0)
 		lastLogTerm := int32(0)
@@ -519,6 +482,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = -1
 			rf.lastHeartbeat = time.Now()
 			DPrintf("[ReceiveRequestVote] [me %v] index is oldest, return", rf.me)
+			rf.stateLock.Unlock()
 			return
 		}
 
@@ -526,7 +490,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		if rf.role != _Follower {
 			DPrintf("[ReceiveRequestVote] [me %v] become follower", rf.me)
+			rf.role = _Unknown
+			rf.stateLock.Unlock()
 			rf.roleCh <- _Follower
+			return
 		}
 
 		reply.VoteGranted = true
@@ -534,8 +501,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// [WARNING] 一旦授权，应该重置超时
 		rf.lastHeartbeat = time.Now()
 		DPrintf("[ReceiveRequestVote] [me %v] granted vote", rf.me)
+		rf.stateLock.Unlock()
 		return
 	}
+	DPrintf("[ReceiveRequestVote] [me %v] return", rf.me)
+	rf.stateLock.Unlock()
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -714,13 +684,13 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 }
 
 func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
-	count := int32(1)
 	success := int32(1)
 	quorum := int32(len(rf.peers)/2 + 1)
-	waitCh := make(chan struct{}, len(rf.peers))
 	wg := sync.WaitGroup{}
 	wg.Add(len(rf.peers))
-	//start := time.Now()
+	rf.stateLock.Lock()
+	maxTerm := rf.currentTerm
+	rf.stateLock.Unlock()
 	for i, _ := range rf.peers {
 		go func(idx int, appendReq AppendEntriesRequest) {
 			defer wg.Done()
@@ -730,23 +700,20 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 					return
 				}
 
-				if !rf.IsLeader() {
-					DPrintf("not leader, existed")
-					waitCh <- struct{}{}
-					return
-				}
-
 				appendReply := &AppendEntriesResponse{}
 				ok := rf.sendAppendEntries(idx, &appendReq, appendReply)
 
 				if !ok {
-					rf.stateLock.Lock()
-					atomic.AddInt32(&count, 1)
-					rf.stateLock.Unlock()
-					break
+					return
 				}
+
 				if appendReply.Success {
 					rf.stateLock.Lock()
+					if appendReq.Term != rf.currentTerm {
+						// role 变更期间, 遇到更大的term
+						rf.stateLock.Unlock()
+						return
+					}
 
 					// 目前使用 同步顺序发送, 所以delta=1
 					rf.matchIndex[idx] = int32(len(rf.log)) - 1
@@ -781,30 +748,31 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 					rf.stateLock.Unlock()
 					for {
 						rf.stateLock.Lock()
-						if rf.commitIndex == int32(len(rf.log)-1) {
+
+						if appendReq.Term != rf.currentTerm {
+							// role 变更期间, 遇到更大的term
 							rf.stateLock.Unlock()
-							break
+							return
+						}
+
+						if rf.commitIndex == int32(len(rf.log)-1) {
+							atomic.AddInt32(&success, 1)
+							rf.stateLock.Unlock()
+							return
 						}
 						rf.stateLock.Unlock()
 						time.Sleep(10 * time.Millisecond)
 					}
-
-					rf.stateLock.Lock()
-					atomic.AddInt32(&count, 1)
-					atomic.AddInt32(&success, 1)
-					rf.stateLock.Unlock()
-					break
 				}
-				// not success reason as below:
-				// Reply false if term < currentTerm, exit
-				// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-				// turn index
 				rf.stateLock.Lock()
-				if rf.currentTerm < appendReply.Term {
-					DPrintf("quorumSendAppendEntries leader %v term is lower", rf.me)
+				if appendReq.Term < appendReply.Term {
+					// check current term whether to change
+					if maxTerm < appendReply.Term {
+						DPrintf("quorumSendAppendEntries leader %v term is lower", rf.me)
+						maxTerm = appendReply.Term
+					}
+					rf.role = _Unknown
 					rf.stateLock.Unlock()
-					rf.roleCh <- _Follower
-					waitCh <- struct{}{}
 					return
 				}
 
@@ -817,29 +785,24 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 				appendReq.Entries = rf.log[appendReply.LogIndexHint+1:]
 				rf.stateLock.Unlock()
 			}
-
-			// 应该是个 请求处理的锁.
-			rf.stateLock.Lock()
-			if count-success >= quorum {
-				// 失败的话，就不是leader了
-				rf.stateLock.Unlock()
-				rf.roleCh <- _Follower
-				waitCh <- struct{}{}
-				return
-			}
-			if success >= quorum {
-				rf.stateLock.Unlock()
-				waitCh <- struct{}{}
-				return
-			}
-			rf.stateLock.Unlock()
 		}(i, req)
 	}
-	<-waitCh
 	wg.Wait()
 	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
-	return success >= quorum
+	if maxTerm > rf.currentTerm {
+		rf.stateLock.Unlock()
+		rf.roleCh <- _Follower
+		return false
+	}
+
+	if success >= quorum {
+		rf.stateLock.Unlock()
+		return true
+	}
+
+	rf.stateLock.Unlock()
+	//rf.roleCh <- _Follower
+	return false
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesResponse) bool {
@@ -924,6 +887,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 			DPrintf("[ReceiveAppendEntries] [me %v] role is leader, receive high term, so convert to follower", rf.me)
 			// how to check whether new leader
 			rf.role = _Unknown
+			rf.currentTerm = args.Term
 			reply.Success = true
 			rf.stateLock.Unlock()
 			rf.roleCh <- _Follower
@@ -933,6 +897,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 
 	if rf.role == _Candidate {
 		DPrintf("[ReceiveAppendEntries] [me %v] role is %v, so convert to follower", rf.me, rf.role)
+		if args.Term > rf.currentTerm {
+			rf.currentTerm = args.Term
+		}
 		rf.stateLock.Unlock()
 		// how to check whether new leader
 		reply.Success = true
@@ -1098,8 +1065,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func init() {
-	runtime.SetBlockProfileRate(500 * 1000 * 1000)
-	runtime.SetMutexProfileFraction(500 * 1000 * 1000)
-
-	http.ListenAndServe(":8088", nil)
+	//runtime.SetBlockProfileRate(500 * 1000 * 1000)
+	//runtime.SetMutexProfileFraction(500 * 1000 * 1000)
+	//
+	//http.ListenAndServe(":8088", nil)
 }
