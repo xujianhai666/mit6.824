@@ -145,6 +145,7 @@ func (rf *Raft) init() {
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]LogEntry, 1)
+	rf.log[0] = LogEntry{}
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -228,8 +229,8 @@ func (rf *Raft) becomeCandidate() {
 	rf.stateLock.Unlock()
 	var (
 		maxTerm = int32(0)
-		//maxLog  = int32(len(rf.log) - 1)
-		maxLog = rf.commitIndex
+		maxLog  = int32(len(rf.log) - 1)
+		//maxLog = rf.commitIndex
 	)
 
 	for {
@@ -250,8 +251,8 @@ func (rf *Raft) becomeCandidate() {
 		rf.currentTerm = rf.currentTerm + 1
 		rf.votedFor = rf.me
 
-		lastLogIndex := rf.commitIndex
-		lastTerm := rf.log[rf.commitIndex].Term
+		lastLogIndex := int32(len(rf.log) - 1)
+		lastTerm := rf.log[lastLogIndex].Term
 		req := &RequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
@@ -337,7 +338,7 @@ func (rf *Raft) becomeCandidate() {
 		}
 
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
-		if maxLog > rf.commitIndex {
+		if maxLog > int32(len(rf.log) - 1) {
 			DPrintf("maxLog triggered\n")
 			electTimeout = 2 * _ElectionTimeout
 		}
@@ -447,7 +448,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("[ReceiveRequestVote] [me %v] log: %v term: %v from [peer %v] start", rf.me, len(rf.log), rf.currentTerm, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	reply.LastLog = rf.commitIndex
+	reply.LastLog = int32(len(rf.log) - 1)
 	if args.Term < rf.currentTerm {
 		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v <= currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.stateLock.Unlock()
@@ -466,8 +467,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.currentTerm = args.Term
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		lastLogIndex := rf.commitIndex
-		lastLogTerm := rf.log[rf.commitIndex].Term
+		lastLogIndex := int32(len(rf.log) - 1)
+		lastLogTerm := rf.log[lastLogIndex].Term
 
 		if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 			rf.votedFor = -1
