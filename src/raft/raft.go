@@ -117,8 +117,8 @@ func (rf *Raft) run() {
 			switch role {
 			case _Leader:
 				rf.stateLock.Lock()
-				//DPrintf("raft: [me %v] now is leader with state: %#v", rf.me, rf.log)
-				DPrintf("raft: [me %v] now is leader", rf.me)
+				DPrintf("raft: [me %v] now is leader with state: %#v", rf.me, rf.log)
+				//DPrintf("raft: [me %v] now is leader", rf.me)
 				rf.stateLock.Unlock()
 				go rf.becomeLeader()
 			case _Follower:
@@ -229,7 +229,7 @@ func (rf *Raft) becomeCandidate() {
 	var (
 		maxTerm = int32(0)
 		//maxLog  = int32(len(rf.log) - 1)
-		maxLog  = rf.commitIndex
+		maxLog = rf.commitIndex
 	)
 
 	for {
@@ -457,12 +457,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm && rf.role != _Follower {
 		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v (non-follower) > currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.currentTerm = args.Term
+		rf.votedFor = -1
 		rf.role = _Unknown
 		rf.stateLock.Unlock()
 		rf.roleCh <- _Follower // maybe bug
 		return
 	}
 
+	rf.currentTerm = args.Term
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastLogIndex := rf.commitIndex
 		lastLogTerm := rf.log[rf.commitIndex].Term
@@ -475,8 +477,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 
-		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
+		// [WARNING] 一旦授权，应该重置超时
+		rf.lastHeartbeat = time.Now()
+		DPrintf("[ReceiveRequestVote] [me %v] granted vote", rf.me)
 		if rf.role != _Follower {
 			DPrintf("[ReceiveRequestVote] [me %v] become follower", rf.me)
 			rf.role = _Unknown
@@ -484,12 +488,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.roleCh <- _Follower
 			return
 		}
-
 		reply.VoteGranted = true
-		reply.Term = args.Term
-		// [WARNING] 一旦授权，应该重置超时
-		rf.lastHeartbeat = time.Now()
-		DPrintf("[ReceiveRequestVote] [me %v] granted vote", rf.me)
 		rf.stateLock.Unlock()
 		return
 	}
@@ -620,6 +619,7 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 								Command:      rf.log[i].Command,
 								CommandIndex: int(i),
 							}
+							DPrintf("[me %v] quorumHeartbeat apply index: %v\n", rf.me, i)
 						}
 						rf.persist()
 					}
@@ -717,7 +717,7 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 					matchIndexes := make([]int, len(rf.peers))
 					for i, _ := range rf.matchIndex {
 						matchIndexes[i] = int(rf.matchIndex[i])
-						DPrintf("match %v index: %v for end index: %v\n", i, matchIndexes[i], len(rf.log)-1)
+						DPrintf("match %v index: %v for end index: %v log: %v#\n", i, matchIndexes[i], len(rf.log)-1, rf.log)
 					}
 					sort.Ints(matchIndexes)
 					i := (len(rf.peers) + 1) / 2
@@ -733,7 +733,9 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 								Command:      rf.log[i].Command,
 								CommandIndex: int(i),
 							}
+							DPrintf("[me %v] quorumSendAppendEntries apply index: %v\n", rf.me, i)
 						}
+
 						rf.lastApplied = rf.commitIndex
 						rf.persist()
 						// 发送 commitIndex 变更事件, 这里不需要
@@ -856,11 +858,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	rf.stateLock.Lock()
 	// use defer
 	reply.Term = rf.currentTerm
-	reply.LogIndexHint = -1
+	reply.LogIndexHint = rf.commitIndex
 
 	if rf.role == _Unknown {
 		DPrintf("[ReceiveAppendEntries] [me %v] is changing role", rf.me)
-		reply.Success = true
+		if len(args.Entries) == 0 {
+			reply.Success = true //  心跳才需要true
+		}
 		rf.stateLock.Unlock()
 		return
 	}
@@ -884,7 +888,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 			// how to check whether new leader
 			rf.role = _Unknown
 			rf.currentTerm = args.Term
-			reply.Success = true
+			if len(args.Entries) == 0 {
+				reply.Success = true // 心跳才需要true
+			}
+			rf.persist()
 			rf.stateLock.Unlock()
 			rf.roleCh <- _Follower
 			return
@@ -895,15 +902,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		DPrintf("[ReceiveAppendEntries] [me %v] role is %v, so convert to follower", rf.me, rf.role)
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
+			rf.persist()
 		}
+		rf.role = _Unknown
 		rf.stateLock.Unlock()
 		// how to check whether new leader
-		reply.Success = true
+		if len(args.Entries) == 0 {
+			reply.Success = true // 心跳才需要true
+		}
 		rf.roleCh <- _Follower
 		return
 	}
 
-	if int32(len(rf.log))-1 < args.PrevLogIndex || (rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+	}
+
+	//if int32(len(rf.log))-1 < args.PrevLogIndex || (rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	if rf.commitIndex < args.PrevLogIndex {
 		DPrintf("[ReceiveAppendEntries] [me %v] log %v is lower %v, exist", rf.me, int32(len(rf.log))-1, args.PrevLogIndex)
 		rf.log = rf.log[:rf.commitIndex+1]
 		reply.LogIndexHint = rf.commitIndex
@@ -914,7 +930,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 
 	// 避免重复apply
 	if len(args.Entries) > 0 {
-		DPrintf("add entries from preIndex: %v", args.PrevLogIndex)
+		DPrintf("[me %v] add entries from preIndex: %v for commitIndex: %v", rf.me, args.PrevLogIndex, rf.commitIndex)
 		rf.log = rf.log[:args.PrevLogIndex+1]
 		for _, e := range args.Entries {
 			rf.log = append(rf.log, LogEntry{
@@ -939,7 +955,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 			CommandIndex: int(i),
 		}
 		rf.lastApplied = i
+		DPrintf("[me %v] AppendEntries apply index: %v\n", rf.me, i)
 	}
+
 	//DPrintf("[me: %v]persist for appendEntries", rf.me)
 	rf.persist()
 	//rf.lastApplied = rf.commitIndex
