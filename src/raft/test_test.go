@@ -341,6 +341,7 @@ loop:
 }
 
 func TestRejoin2B(t *testing.T) {
+	Debug = 0
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -368,6 +369,8 @@ func TestRejoin2B(t *testing.T) {
 	// old leader connected again
 	cfg.connect(leader1)
 
+	Debug = 1
+	DPrintf("start 104")
 	cfg.one(104, 2, true)
 
 	// all together now

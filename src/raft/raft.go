@@ -162,10 +162,10 @@ func (rf *Raft) becomeLeader() { // add term param
 	rf.nextIndex = make([]int32, len(rf.peers))  // (initialized to leader last log index + 1)
 	rf.matchIndex = make([]int32, len(rf.peers)) // (initialized to 0, increases monotonically)
 
-	lastLogIndex := int32(0)
-	if len(rf.log) > 1 {
-		lastLogIndex = int32(len(rf.log) - 1)
-	}
+	lastLogIndex := rf.commitIndex
+	//if len(rf.log) > 1 {
+	//	lastLogIndex = int32(len(rf.log) - 1)
+	//}
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = lastLogIndex + 1
 	}
@@ -231,7 +231,8 @@ func (rf *Raft) becomeCandidate() {
 	rf.stateLock.Unlock()
 	var (
 		maxTerm = int32(0)
-		maxLog  = int32(len(rf.log) - 1)
+		//maxLog  = int32(len(rf.log) - 1)
+		maxLog  = rf.commitIndex
 	)
 
 	for {
@@ -254,12 +255,6 @@ func (rf *Raft) becomeCandidate() {
 
 		lastLogIndex := rf.commitIndex
 		lastTerm := rf.log[rf.commitIndex].Term
-		//lastTerm := int32(0)
-		//lastLogIndex := int32(0)
-		//if len(rf.log) > 1 {
-		//	lastLogIndex = int32(len(rf.log) - 1)
-		//	lastTerm = rf.log[lastLogIndex].Term
-		//}
 		req := &RequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
@@ -345,7 +340,7 @@ func (rf *Raft) becomeCandidate() {
 		}
 
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
-		if maxLog > int32(len(rf.log)-1) {
+		if maxLog > rf.commitIndex {
 			DPrintf("maxLog triggered\n")
 			electTimeout = 2 * _ElectionTimeout
 		}
@@ -455,7 +450,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("[ReceiveRequestVote] [me %v] log: %v term: %v from [peer %v] start", rf.me, len(rf.log), rf.currentTerm, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	reply.LastLog = int32(len(rf.log) - 1)
+	reply.LastLog = rf.commitIndex
 	if args.Term < rf.currentTerm {
 		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v <= currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.stateLock.Unlock()
@@ -474,12 +469,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastLogIndex := rf.commitIndex
 		lastLogTerm := rf.log[rf.commitIndex].Term
-		//lastLogIndex := int32(0)
-		//lastLogTerm := int32(0)
-		//if len(rf.log) > 1 {
-		//	lastLogIndex = int32(len(rf.log) - 1)
-		//	lastLogTerm = rf.log[lastLogIndex].Term
-		//}
 
 		if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 			rf.votedFor = -1
@@ -771,7 +760,7 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 				if appendReq.Term < appendReply.Term {
 					// check current term whether to change
 					if maxTerm < appendReply.Term {
-						DPrintf("quorumSendAppendEntries leader %v term is lower", rf.me)
+						DPrintf("quorumSendAppendEntries leader %v term %v is lower than term: %v", rf.me, rf.currentTerm, appendReply.Term)
 						maxTerm = appendReply.Term
 					}
 					rf.role = _Unknown
@@ -793,6 +782,7 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 	wg.Wait()
 	rf.stateLock.Lock()
 	if maxTerm > rf.currentTerm {
+		rf.currentTerm = maxTerm
 		rf.stateLock.Unlock()
 		rf.roleCh <- _Follower
 		return false
@@ -843,7 +833,8 @@ func (rf *Raft) monitorLeader() {
 			rf.roleCh <- _Candidate
 			return
 		}
-		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
+		//electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
+		electTimeout := _ElectionTimeout
 		rf.stateLock.Unlock()
 		select {
 		case <-time.NewTimer(electTimeout).C:
@@ -873,7 +864,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	}
 
 	if args.Term < rf.currentTerm {
-		DPrintf("[ReceiveAppendEntries] [me %v] args Term is lower, exist", rf.me)
+		DPrintf("[ReceiveAppendEntries] [me %v] args Term: %v is lower than me: %v, exist", rf.me, args.Term, rf.currentTerm)
 		rf.stateLock.Unlock()
 		return
 	}
