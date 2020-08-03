@@ -26,7 +26,6 @@ type LogEntry struct {
 }
 
 type _Role int32
-type _Reason int32
 
 const (
 	_Unknown _Role = iota
@@ -41,6 +40,11 @@ const (
 	_HeartbeatTimeout     = 120 * time.Millisecond
 	_NetworkTimeout       = 20 * time.Millisecond
 )
+
+type TermRole struct {
+	role _Role
+	term int32
+}
 
 var (
 	electRand = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -535,7 +539,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	var ok bool
 	go func() {
 		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
-		waitCh <- struct{}{}
+		close(waitCh)
 	}()
 	select {
 	case <-ctx.Done():
@@ -587,7 +591,6 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 	count := int32(1)
 	success := int32(1)
 	quorum := int32(len(rf.peers)/2 + 1)
-	waitCh := make(chan struct{}, len(rf.peers))
 	wg := sync.WaitGroup{}
 	wg.Add(len(rf.peers))
 	for i, _ := range rf.peers {
@@ -600,7 +603,6 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 				}
 
 				if !rf.IsLeader() {
-					waitCh <- struct{}{}
 					return
 				}
 
@@ -668,7 +670,6 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 						return
 					case rf.roleCh <- _Follower:
 					}
-					waitCh <- struct{}{}
 					return
 				}
 
@@ -686,18 +687,15 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 			rf.stateLock.Lock()
 			if success >= quorum {
 				rf.stateLock.Unlock()
-				waitCh <- struct{}{}
 				return
 			}
 			if count-success >= quorum {
 				rf.stateLock.Unlock()
-				waitCh <- struct{}{}
 				return
 			}
 			rf.stateLock.Unlock()
 		}(i, appendReq)
 	}
-	<-waitCh
 	wg.Wait()
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
@@ -849,7 +847,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 	var ok bool
 	go func() {
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
-		waitCh <- struct{}{}
+		close(waitCh)
 	}()
 	select {
 	case <-ctx.Done():
@@ -974,7 +972,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	}
 
 	if int32(len(rf.log))-1 < args.PrevLogIndex || (rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-	// if rf.commitIndex < args.PrevLogIndex {
+		// if rf.commitIndex < args.PrevLogIndex {
 		DPrintf("[ReceiveAppendEntries] [me %v] log %v is lower %v, exist", rf.me, int32(len(rf.log))-1, args.PrevLogIndex)
 		rf.log = rf.log[:rf.commitIndex+1]
 		reply.LogIndexHint = rf.commitIndex

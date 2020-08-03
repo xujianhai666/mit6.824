@@ -808,6 +808,27 @@ func TestUnreliableAgree2C(t *testing.T) {
 }
 
 func TestFigure8Unreliable2C(t *testing.T) {
+	//f, err := os.Create("output")
+	//if err != nil {
+	//	panic(err)
+	//}
+	//pprof.StartCPUProfile(f)
+	//
+	//
+	//tf, err := os.Create("trace")
+	//if err != nil {
+	//	panic(err)
+	//}
+	//trace.Start(tf)
+	//
+	//defer func() {
+	//	trace.Stop()
+	//}()
+	//
+	//defer func() {
+	//	pprof.StopCPUProfile()
+	//}()
+
 	servers := 5
 	cfg := make_config(t, servers, true)
 	defer cfg.cleanup()
@@ -829,7 +850,9 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			}
 		}
 
+		// 1/10 少睡, 不然多睡 
 		if (rand.Int() % 1000) < 100 {
+			// 500 取余
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		} else {
@@ -837,11 +860,13 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
+		// 一半的概率阻断 leader的网络
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
 			cfg.disconnect(leader)
 			nup -= 1
 		}
 
+		// 低于半数, 尝试恢复一台
 		if nup < 3 {
 			s := rand.Int() % servers
 			if cfg.connected[s] == false {
@@ -857,6 +882,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
+	// 尝试成功
 	cfg.one(rand.Int()%10000, servers, true)
 
 	cfg.end()
