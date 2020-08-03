@@ -8,7 +8,12 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"os"
+	"runtime/pprof"
+	"runtime/trace"
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
@@ -1007,5 +1012,25 @@ func TestReliableChurn2C(t *testing.T) {
 }
 
 func TestUnreliableChurn2C(t *testing.T) {
+	f, err := os.Create("output")
+	if err != nil {
+		panic(err)
+	}
+	pprof.StartCPUProfile(f)
+
+
+	tf, err := os.Create("trace")
+	if err != nil {
+		panic(err)
+	}
+	trace.Start(tf)
+	defer func() {
+
+		trace.Stop()
+		pprof.StopCPUProfile()
+		f.Close()
+		tf.Close()
+	}()
+
 	internalChurn(t, true)
 }

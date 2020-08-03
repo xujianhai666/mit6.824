@@ -140,6 +140,7 @@ func (rf *Raft) run() {
 				//DPrintf("raft: [me %v] now is candidate %#v", rf.me, rf.log)
 				DPrintf("raft: [me %v] now is candidate", rf.me)
 				rf.stateLock.Unlock()
+				rf.exitWg.Add(1)
 				go rf.becomeCandidate()
 			}
 		}
@@ -231,6 +232,7 @@ func (rf *Raft) becomeFollower() {
 // election timeouts in the range of 150 to 300 milliseconds.  tester limits you to 10 heartbeats per second.
 // TODO: 允许多个 状态并行
 func (rf *Raft) becomeCandidate() {
+	defer rf.exitWg.Done()
 	rf.stateLock.Lock()
 	if rf.role == _Candidate || rf.killed() {
 		rf.stateLock.Unlock()
@@ -1096,8 +1098,8 @@ func (rf *Raft) Kill() {
 	<-rf.deadCh
 
 	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
 	rf.persist()
+	rf.stateLock.Unlock()
 	rf.exitWg.Wait()
 }
 
@@ -1134,9 +1136,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func init() {
-	//runtime.SetBlockProfileRate(500 * 1000 * 1000)
-	//runtime.SetMutexProfileFraction(500 * 1000 * 1000)
-	//
-	//http.ListenAndServe(":8088", nil)
-}
+//func init() {
+//	runtime.SetBlockProfileRate(500 * 1000 * 1000)
+//	runtime.SetMutexProfileFraction(500 * 1000 * 1000)
+//
+//	http.ListenAndServe(":8088", nil)
+//}
