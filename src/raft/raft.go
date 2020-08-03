@@ -174,7 +174,7 @@ func (rf *Raft) becomeLeader() { // add term param
 	rf.nextIndex = make([]int32, len(rf.peers))  // (initialized to leader last log index + 1)
 	rf.matchIndex = make([]int32, len(rf.peers)) // (initialized to 0, increases monotonically)
 
-	lastLogIndex := rf.commitIndex
+	lastLogIndex := int32(len(rf.log)) - 1
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = lastLogIndex + 1
 	}
@@ -973,8 +973,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.currentTerm = args.Term
 	}
 
-	//if int32(len(rf.log))-1 < args.PrevLogIndex || (rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-	if rf.commitIndex < args.PrevLogIndex {
+	if int32(len(rf.log))-1 < args.PrevLogIndex || (rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	// if rf.commitIndex < args.PrevLogIndex {
 		DPrintf("[ReceiveAppendEntries] [me %v] log %v is lower %v, exist", rf.me, int32(len(rf.log))-1, args.PrevLogIndex)
 		rf.log = rf.log[:rf.commitIndex+1]
 		reply.LogIndexHint = rf.commitIndex
