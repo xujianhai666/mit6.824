@@ -421,7 +421,7 @@ func (rf *Raft) persist() {
 	e.Encode(state)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	DPrintf("rf [me %v] save stateInfo: %#v", rf.me, state)
+	//DPrintf("rf [me %v] save stateInfo: %#v", rf.me, state)
 }
 
 //
