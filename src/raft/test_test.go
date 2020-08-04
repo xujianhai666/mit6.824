@@ -9,9 +9,6 @@ package raft
 //
 
 import (
-	"os"
-	"runtime/pprof"
-	"runtime/trace"
 	"testing"
 )
 import "fmt"
@@ -883,7 +880,9 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	}
 
 	// 尝试成功
-	cfg.one(rand.Int()%10000, servers, true)
+	DPrintf("final try")
+	//cfg.one(rand.Int()%10000, servers, true)
+	cfg.one(1919, servers, true)
 
 	cfg.end()
 }
@@ -1038,25 +1037,24 @@ func TestReliableChurn2C(t *testing.T) {
 }
 
 func TestUnreliableChurn2C(t *testing.T) {
-	f, err := os.Create("output")
-	if err != nil {
-		panic(err)
-	}
-	pprof.StartCPUProfile(f)
-
-
-	tf, err := os.Create("trace")
-	if err != nil {
-		panic(err)
-	}
-	trace.Start(tf)
-	defer func() {
-
-		trace.Stop()
-		pprof.StopCPUProfile()
-		f.Close()
-		tf.Close()
-	}()
+	//f, err := os.Create("output")
+	//if err != nil {
+	//	panic(err)
+	//}
+	//pprof.StartCPUProfile(f)
+	//
+	//tf, err := os.Create("trace")
+	//if err != nil {
+	//	panic(err)
+	//}
+	//trace.Start(tf)
+	//defer func() {
+	//
+	//	trace.Stop()
+	//	pprof.StopCPUProfile()
+	//	f.Close()
+	//	tf.Close()
+	//}()
 
 	internalChurn(t, true)
 }
