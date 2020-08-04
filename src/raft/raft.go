@@ -208,9 +208,13 @@ func (rf *Raft) becomeLeader() { // add term param
 			rf.lastHeartbeat = now
 			rf.stateLock.Unlock()
 		}
+		timeout := time.NewTimer(20 * time.Millisecond)
 		select {
-		case <-time.NewTimer(20 * time.Millisecond).C:
+		case <-timeout.C:
 		case <-rf.closeCh:
+			if !timeout.Stop() {
+				<-timeout.C
+			}
 			return
 		}
 	}
@@ -244,12 +248,14 @@ func (rf *Raft) becomeCandidate() {
 	}
 	rf.role = _Candidate
 	atomic.StoreInt32(&rf.isLeader, 0)
-	rf.stateLock.Unlock()
+
 	var (
-		maxTerm = int32(0)
-		maxLog  = int32(len(rf.log) - 1)
+		maxTerm    = int32(0)
+		maxLog     = int32(len(rf.log) - 1)
+		maxLogTerm = rf.log[maxLog].Term
 		//maxLog = rf.commitIndex
 	)
+	rf.stateLock.Unlock()
 
 	for {
 		if rf.killed() {
@@ -265,7 +271,6 @@ func (rf *Raft) becomeCandidate() {
 			rf.stateLock.Unlock()
 			return
 		}
-
 		rf.currentTerm = rf.currentTerm + 1
 		rf.votedFor = rf.me
 
@@ -308,6 +313,9 @@ func (rf *Raft) becomeCandidate() {
 				} else {
 					if maxLog < reply.LastLog {
 						maxLog = reply.LastLog
+					}
+					if maxLogTerm < reply.LastLogTerm {
+						maxLogTerm = reply.LastLogTerm
 					}
 					if maxTerm < reply.Term {
 						maxTerm = reply.Term + 1
@@ -357,22 +365,23 @@ func (rf *Raft) becomeCandidate() {
 			return
 		}
 
-		if count-granted >= quorum {
-			DPrintf("sendRequestVote [me %v] get not granted >= quorum", rf.me)
-			// elect failed, so back to origin
-			rf.votedFor = -1
-		}
+		DPrintf("sendRequestVote [me %v] get not granted >= quorum", rf.me)
+		rf.votedFor = -1
 
 		electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
-		if maxLog > int32(len(rf.log)-1) {
-			DPrintf("maxLog triggered\n")
+		if maxLog > int32(len(rf.log)-1) || maxLogTerm > rf.log[len(rf.log)-1].Term {
+			DPrintf("[me: %v ] maxLog or maxTerm triggered, so sleep more\n", rf.me)
 			electTimeout = 2 * _ElectionTimeout
 		}
 		DPrintf("[me %v] elect timeout: %v with term: %v\n", rf.me, electTimeout, rf.currentTerm)
 		rf.stateLock.Unlock()
+		timeout := time.NewTimer(electTimeout)
 		select {
-		case <-time.NewTimer(electTimeout).C:
+		case <-timeout.C:
 		case <-rf.closeCh:
+			if !timeout.Stop() {
+				<-timeout.C
+			}
 			return
 		}
 	}
@@ -458,6 +467,7 @@ type RequestVoteReply struct {
 	Term        int32 // currentTerm, for candidate to update itself
 	VoteGranted bool  // true means candidate received vote
 	LastLog     int32 // last log index
+	LastLogTerm int32 // last log index
 }
 
 //
@@ -471,31 +481,45 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//DPrintf("[ReceiveRequestVote] [me %v] from [peer %v] start", rf.me, args.CandidateId)
 	rf.stateLock.Lock()
 
-	DPrintf("[ReceiveRequestVote] [me %v] log: %v term: %v from [peer %v] start", rf.me, len(rf.log), rf.currentTerm, args)
+	debugVoteArgs := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.votedFor,
+		LastLogIndex: int32(len(rf.log) - 1),
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+	}
+	DPrintf("[ReceiveRequestVote] [me %v] self info: %v from [peer %#v] start", rf.me, debugVoteArgs, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	reply.LastLog = int32(len(rf.log) - 1)
+	reply.LastLogTerm = rf.log[reply.LastLog].Term
 	if args.Term < rf.currentTerm {
 		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v <= currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		rf.stateLock.Unlock()
 		return
 	}
 
-	if args.Term > rf.currentTerm && rf.role != _Follower {
-		DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v (non-follower) > currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+	convrt2Follower := false
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.role = _Unknown
-		rf.stateLock.Unlock()
-		select {
-		case <-rf.closeCh:
-			return
-		case rf.roleCh <- _Follower:
-		}
-		return
+		convrt2Follower = true
 	}
 
-	rf.currentTerm = args.Term
+	//if args.Term > rf.currentTerm && rf.role != _Follower {
+	//	DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v (non-follower) > currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+	//	// add vote info, 减少一次ftt
+	//	rf.currentTerm = args.Term
+	//	rf.votedFor = -1
+	//	rf.role = _Unknown
+	//	rf.stateLock.Unlock()
+	//	select {
+	//	case <-rf.closeCh:
+	//		return
+	//	case rf.roleCh <- _Follower:
+	//	}
+	//	return
+	//}
+	//rf.currentTerm = args.Term
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastLogIndex := int32(len(rf.log) - 1)
 		lastLogTerm := rf.log[lastLogIndex].Term
@@ -504,6 +528,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = -1
 			rf.lastHeartbeat = time.Now()
 			DPrintf("[ReceiveRequestVote] [me %v] index from [%v] is oldest, return", rf.me, args.CandidateId)
+
+			if convrt2Follower {
+				DPrintf("[ReceiveRequestVote] [me %v] from %v Term :%v (non-follower) > currentTerm: %v, return", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+				rf.role = _Unknown
+				rf.stateLock.Unlock()
+				select {
+				case <-rf.closeCh:
+				case rf.roleCh <- _Follower:
+				}
+				return
+			}
+
 			rf.stateLock.Unlock()
 			return
 		}
@@ -511,7 +547,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		// [WARNING] 一旦授权，应该重置超时
 		rf.lastHeartbeat = time.Now()
-		DPrintf("[ReceiveRequestVote] [me %v] granted vote", rf.me)
+		DPrintf("[ReceiveRequestVote] [me %v] granted vote for %v", rf.me, args.CandidateId)
 		if rf.role != _Follower {
 			DPrintf("[ReceiveRequestVote] [me %v] become follower", rf.me)
 			rf.role = _Unknown
@@ -527,7 +563,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.stateLock.Unlock()
 		return
 	}
-	DPrintf("[ReceiveRequestVote] [me %v] return", rf.me)
+	DPrintf("[ReceiveRequestVote] [me %v] have voted: %v, return", rf.me, rf.votedFor)
 	rf.stateLock.Unlock()
 }
 
@@ -880,9 +916,13 @@ func (rf *Raft) monitorLeader() {
 		//electTimeout := _ElectionTimeout + time.Duration(rand.Intn(int(_DeltaElectionTimeout)))
 		electTimeout := _ElectionTimeout
 		rf.stateLock.Unlock()
+		timeout := time.NewTimer(electTimeout)
 		select {
-		case <-time.NewTimer(electTimeout).C:
+		case <-timeout.C:
 		case <-rf.closeCh:
+			if !timeout.Stop() {
+				<-timeout.C
+			}
 			return
 		}
 	}

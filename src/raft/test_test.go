@@ -790,9 +790,9 @@ func TestUnreliableAgree2C(t *testing.T) {
 	for iters := 1; iters < 50; iters++ {
 		for j := 0; j < 4; j++ {
 			wg.Add(1)
-			go func(iters, j int) {
+			go func(x, y int) {
 				defer wg.Done()
-				cfg.one((100*iters)+j, 1, true)
+				cfg.one((100*x)+y, 1, true)
 			}(iters, j)
 		}
 		cfg.one(iters, 1, true)
