@@ -1,6 +1,8 @@
 package kvraft
 
-import "../porcupine"
+import (
+	"../porcupine"
+)
 import "../models"
 import "testing"
 import "strconv"
@@ -148,8 +150,8 @@ func partitioner(t *testing.T, cfg *config, ch chan bool, done *int32) {
 // particular key.  If unreliable is set, RPCs may fail.  If crash is set, the
 // servers crash after the period is over and restart.  If partitions is set,
 // the test repartitions the network concurrently with the clients and servers. If
-// maxraftstate is a positive number, the size of the state for Raft (i.e., log
-// size) shouldn't exceed 8*maxraftstate. If maxraftstate is negative,
+// maxRaftState is a positive number, the size of the state for Raft (i.e., log
+// size) shouldn't exceed 8*maxRaftState. If maxRaftState is negative,
 // snapshots shouldn't be used.
 func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash bool, partitions bool, maxraftstate int) {
 
@@ -195,8 +197,30 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 		// log.Printf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
+		//i := i
 		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
 			j := 0
+
+			//f, err := os.Create("output_" + strconv.Itoa(cli) + "_" + strconv.Itoa(i))
+			//if err != nil {
+			//	panic(err)
+			//}
+			//pprof.StartCPUProfile(f)
+			//
+			//tf, err := os.Create("trace_" + strconv.Itoa(cli) + "_" + strconv.Itoa(i))
+			//if err != nil {
+			//	panic(err)
+			//}
+			//trace.Start(tf)
+			//
+			//defer func() {
+			//	trace.Stop()
+			//}()
+			//
+			//defer func() {
+			//	pprof.StopCPUProfile()
+			//}()
+
 			defer func() {
 				clnts[cli] <- j
 			}()
@@ -206,12 +230,11 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			for atomic.LoadInt32(&done_clients) == 0 {
 				if (rand.Int() % 1000) < 500 {
 					nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-					// log.Printf("%d: client new append %v\n", cli, nv)
+					//log.Printf("%d: client new append %v\n", cli, nv)
 					Append(cfg, myck, key, nv)
 					last = NextValue(last, nv)
 					j++
 				} else {
-					// log.Printf("%d: client new get %v\n", cli, key)
 					v := Get(cfg, myck, key)
 					if v != last {
 						log.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
@@ -283,7 +306,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			// Check that snapshots are not used
 			ssz := cfg.SnapshotSize()
 			if ssz > 0 {
-				t.Fatalf("snapshot too large (%v), should not be used when maxraftstate = %d", ssz, maxraftstate)
+				t.Fatalf("snapshot too large (%v), should not be used when maxRaftState = %d", ssz, maxraftstate)
 			}
 		}
 	}

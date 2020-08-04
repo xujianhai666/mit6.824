@@ -35,10 +35,10 @@ const (
 )
 
 const (
-	_ElectionTimeout      = 200 * time.Millisecond
-	_DeltaElectionTimeout = 200 * time.Millisecond
-	_HeartbeatTimeout     = 120 * time.Millisecond
-	_NetworkTimeout       = 20 * time.Millisecond
+	_ElectionTimeout      = 150 * time.Millisecond
+	_DeltaElectionTimeout = 300 * time.Millisecond
+	_HeartbeatTimeout     = 50 * time.Millisecond
+	_NetworkTimeout       = 50 * time.Millisecond // TODO: add cancel notify to rpc, use ctx cancel
 )
 
 type TermRole struct {
@@ -80,6 +80,7 @@ type Raft struct {
 	lastApplied   int32 // index of highest log entry applied to state machine
 	lastHeartbeat time.Time
 	executeLock   sync.Mutex // use lock to keep fifo, reduce code len
+	startCmdLock  sync.Mutex // use lock to keep fifo, reduce code len
 	exitWg        sync.WaitGroup
 
 	// leader info
@@ -421,7 +422,7 @@ func (rf *Raft) persist() {
 	e.Encode(state)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	DPrintf("rf [me %v] save stateInfo: %#v", rf.me, state)
+	//DPrintf("rf [me %v] save stateInfo: %#v", rf.me, state)
 }
 
 //
@@ -632,12 +633,21 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 
 				appendReply := &AppendEntriesResponse{}
 
+				rf.stateLock.Lock()
+				ref := appendReq.Entries
+				entries := make([]LogEntry, len(ref))
+				for i := range ref {
+					entries[i] = ref[i]
+				}
+				rf.stateLock.Unlock()
+
 				r := &AppendEntriesRequest{
 					Term:         appendReq.Term,
 					LeaderId:     appendReq.LeaderId,
 					PrevLogIndex: appendReq.PrevLogIndex,
 					PrevLogTerm:  appendReq.PrevLogTerm,
-					Entries:      appendReq.Entries,
+					//Entries:      appendReq.Entries,
+					Entries:      entries,
 					LeaderCommit: appendReq.LeaderCommit,
 				}
 				ok := rf.sendAppendEntries(idx, r, appendReply)
@@ -668,9 +678,9 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 
 					// channel notify
 					if int32(majority) > rf.commitIndex {
-						rf.commitIndex = int32(majority)
+						commitIndex := int32(majority)
 						// trigger apply
-						for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+						for i := rf.lastApplied + 1; i <= commitIndex; i++ {
 							rf.stateMachine <- ApplyMsg{
 								CommandValid: true,
 								Command:      rf.log[i].Command,
@@ -678,6 +688,8 @@ func (rf *Raft) quorumHeartbeat(appendReq AppendEntriesRequest) bool {
 							}
 							DPrintf("[me %v] quorumHeartbeat apply index: %v\n", rf.me, i)
 						}
+						rf.commitIndex = int32(majority)
+						rf.lastApplied = rf.commitIndex
 						rf.persist()
 					}
 					rf.stateLock.Unlock()
@@ -743,7 +755,14 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 			rf.stateLock.Lock()
 			appendReq.PrevLogIndex = rf.nextIndex[idx] - 1
 			appendReq.PrevLogTerm = rf.log[appendReq.PrevLogIndex].Term
-			appendReq.Entries = rf.log[rf.nextIndex[idx]:]
+
+			ref := rf.log[rf.nextIndex[idx]:]
+			entries := make([]LogEntry, len(ref))
+			for i := range ref {
+				entries[i] = ref[i]
+			}
+			//appendReq.Entries = rf.log[rf.nextIndex[idx]:]
+			appendReq.Entries = entries
 			rf.stateLock.Unlock()
 			for { // retry fro log inconsistency
 
@@ -755,16 +774,25 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 				ok := rf.sendAppendEntries(idx, &appendReq, appendReply)
 
 				if !ok {
+					DPrintf("[me %v] received no message from %v", rf.me, idx)
 					return
 				}
 
+				rf.stateLock.Lock()
+				if appendReq.Term != rf.currentTerm {
+					// role 变更期间, 遇到更大的term
+					rf.stateLock.Unlock()
+					return
+				}
+				rf.stateLock.Unlock()
+
 				if appendReply.Success {
 					rf.stateLock.Lock()
-					if appendReq.Term != rf.currentTerm {
-						// role 变更期间, 遇到更大的term
-						rf.stateLock.Unlock()
-						return
-					}
+					//if appendReq.Term != rf.currentTerm {
+					// //	role 变更期间, 遇到更大的term
+					//rf.stateLock.Unlock()
+					//return
+					//}
 
 					// 目前使用 同步顺序发送, 所以delta=1
 					rf.matchIndex[idx] = int32(len(rf.log)) - 1
@@ -774,7 +802,8 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 					matchIndexes := make([]int, len(rf.peers))
 					for i, _ := range rf.matchIndex {
 						matchIndexes[i] = int(rf.matchIndex[i])
-						DPrintf("[me %v ]match %v index: %v for end index: %v log: %v#\n", rf.me, i, matchIndexes[i], len(rf.log)-1, rf.log)
+						//DPrintf("[me %v ]match %v index: %v for end index: %v log: %v#\n", rf.me, i, matchIndexes[i], len(rf.log)-1, rf.log)
+						DPrintf("[me %v ]match %v index: %v for end index: %+v log: %v#\n", rf.me, i, matchIndexes[i], len(rf.log)-1, rf.log[len(rf.log)-1])
 					}
 					sort.Ints(matchIndexes)
 					i := (len(rf.peers) + 1) / 2
@@ -782,9 +811,9 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 
 					// channel notify
 					if int32(majority) > rf.commitIndex {
-						rf.commitIndex = int32(majority)
+						commitIndex := int32(majority)
 						// trigger apply
-						for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+						for i := rf.lastApplied + 1; i <= commitIndex; i++ {
 							rf.stateMachine <- ApplyMsg{
 								CommandValid: true,
 								Command:      rf.log[i].Command,
@@ -793,6 +822,7 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 							DPrintf("[me %v] quorumSendAppendEntries apply index: %v\n", rf.me, i)
 						}
 
+						rf.commitIndex = commitIndex
 						rf.lastApplied = rf.commitIndex
 						rf.persist()
 						// 发送 commitIndex 变更事件, 这里不需要
@@ -800,6 +830,10 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 					// 等待 commitIndex 到最新值
 					rf.stateLock.Unlock()
 					for {
+						if rf.killed() {
+							return
+						}
+
 						rf.stateLock.Lock()
 
 						if appendReq.Term != rf.currentTerm {
@@ -808,6 +842,7 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 							return
 						}
 
+						// TODO(zero.xu): use condition better
 						if rf.commitIndex == int32(len(rf.log)-1) {
 							atomic.AddInt32(&success, 1)
 							rf.stateLock.Unlock()
@@ -865,18 +900,22 @@ func (rf *Raft) quorumSendAppendEntries(req AppendEntriesRequest) bool {
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesResponse) bool {
 	ctx := context.Background()
+	//ctx, cancelF := context.WithTimeout(ctx, _HeartbeatTimeout)
 	ctx, cancelF := context.WithTimeout(ctx, _NetworkTimeout)
 	defer cancelF()
 	waitCh := make(chan struct{})
 	var ok bool
 	go func() {
+		DPrintf("sendAppendEntries args in %v : %v for %v", rf.me, args, server)
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 		close(waitCh)
 	}()
 	select {
 	case <-ctx.Done():
+		DPrintf("[me %v] peer %v receive timeout", rf.me, server)
 		return false
 	case <-waitCh:
+		DPrintf("[me %v] peer %v receive reply %+v", rf.me, server, reply)
 		return ok
 	}
 }
@@ -1065,6 +1104,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.startCmdLock.Lock()
+	defer rf.startCmdLock.Unlock()
+
 	index := -1
 	term := int32(-1)
 	isLeader := true
@@ -1090,7 +1132,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, newEntry)
 	//rf.persist()
 	rf.matchIndex[rf.me] = int32(len(rf.log) - 1)
-	DPrintf("[me : %v]start command: %v at index: %v", rf.me, command, int32(len(rf.log) - 1))
+	DPrintf("[me : %v]start command: %v at index: %v", rf.me, command, int32(len(rf.log)-1))
 	entries := []LogEntry{newEntry}
 	appendReq := AppendEntriesRequest{
 		Term:         rf.currentTerm,
@@ -1103,11 +1145,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.stateLock.Unlock()
 
 	quorumAck := rf.quorumSendAppendEntries(appendReq)
-	if !quorumAck {
-		return int(preLogIndex) + 1, int(term), true
+	if quorumAck {
+		// Your code here (2B).
+		return int(preLogIndex) + 1, int(term), isLeader
 	}
 
-	// Your code here (2B).
+	_, isLeader = rf.GetState()
+	if !isLeader {
+		return index, int(term), false
+	}
 	return int(preLogIndex) + 1, int(term), isLeader
 }
 
